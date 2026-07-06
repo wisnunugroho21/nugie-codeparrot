@@ -26,6 +26,9 @@ configs/
   colab_t4.yaml    # 1x T4 (Colab), ~190M params, bf16
   kaggle_2xt4.yaml # 2x T4 (Kaggle), data-parallel over both GPUs
   h200.yaml        # 1x H200, ~2.4B-param sparse-MoE run
+notebooks/
+  colab_train_t4.ipynb     # run the whole pipeline on Google Colab (1x T4)
+  kaggle_train_2xt4.ipynb  # run it on Kaggle (2x T4, data-parallel)
 pipeline/
   config.py        # typed YAML config (model + data + train), with validation
   tokenizer.py     # byte-level or pretrained codeparrot BPE tokenizer
@@ -81,6 +84,11 @@ toward the paper's scale as your hardware allows.
 | `colab_t4.yaml`    | 1x T4 (16 GB) | bf16 | ~190M, seq 512, batch 8 | T4 has no bf16 tensor cores — bf16 saves memory, not speed. Use `float32` for max stability. |
 | `kaggle_2xt4.yaml` | 2x T4 (2x16 GB) | bf16 | same as Colab, batch 16 | **Data-parallel** across both GPUs (8/GPU). Second GPU adds throughput, not model size. |
 | `h200.yaml`        | 1x H200 (141 GB) | bf16 | ~2.4B MoE, seq 1024, batch 32 | Native bf16 tensor cores. Scale `seq_len`/experts up; watch O(L²) MLA memory. |
+
+**Notebooks.** `notebooks/colab_train_t4.ipynb` and `notebooks/kaggle_train_2xt4.ipynb`
+run the full install → prepare → train → evaluate → generate flow on Colab and Kaggle
+respectively (edit the `REPO_URL` cell to point at your clone). The Kaggle one needs
+*Accelerator = GPU T4 x2* and *Internet = On*.
 
 **Multi-GPU is automatic.** `train.py` detects `jax.device_count()`, replicates the
 params + Adam state on every device, and shards each batch across them (GSPMD data
