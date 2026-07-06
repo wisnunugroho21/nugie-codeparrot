@@ -238,7 +238,14 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
 
         if (step + 1) % tc.save_every == 0:
             ckpt.save(step, optimizer)
+            # Block until the async save commits BEFORE training resumes. Orbax pins the
+            # full fp32 optimizer state (params + Adam m/v) on-device until the save
+            # finishes; letting the next steps run concurrently stacks their working set
+            # on top of it and OOMs small GPUs (e.g. a 15 GB T4). Waiting here serializes
+            # save vs. train — a few idle seconds every save_every steps, no memory spike.
+            ckpt.wait_until_finished()
             print(f"  [ckpt] saved step {step}", flush=True)
+            t0 = time.time()  # don't count save time against tok/s
 
     # final checkpoint
     ckpt.save(tc.max_steps - 1, optimizer)
