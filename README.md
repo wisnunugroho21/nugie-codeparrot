@@ -23,6 +23,9 @@ schedule:
 configs/
   tiny.yaml        # offline smoke test: synthetic data + byte vocab, runs on CPU
   base.yaml        # real run: CodeParrot corpus + BPE tokenizer, bf16, GPU-scale
+  colab_t4.yaml    # 1x T4 (Colab), ~190M params, bf16
+  kaggle_2xt4.yaml # 2x T4 (Kaggle), data-parallel over both GPUs
+  h200.yaml        # 1x H200, ~2.4B-param sparse-MoE run
 pipeline/
   config.py        # typed YAML config (model + data + train), with validation
   tokenizer.py     # byte-level or pretrained codeparrot BPE tokenizer
@@ -70,6 +73,26 @@ python -m pipeline.evaluate --config configs/base.yaml --generate \
 
 Raise `data.num_train_docs`, `model.d_model`, `model.n_layers`, and `model.moe_n_routed`
 toward the paper's scale as your hardware allows.
+
+## Device configs
+
+| Config | Hardware | Precision | Model | Notes |
+|--------|----------|-----------|-------|-------|
+| `colab_t4.yaml`    | 1x T4 (16 GB) | bf16 | ~190M, seq 512, batch 8 | T4 has no bf16 tensor cores — bf16 saves memory, not speed. Use `float32` for max stability. |
+| `kaggle_2xt4.yaml` | 2x T4 (2x16 GB) | bf16 | same as Colab, batch 16 | **Data-parallel** across both GPUs (8/GPU). Second GPU adds throughput, not model size. |
+| `h200.yaml`        | 1x H200 (141 GB) | bf16 | ~2.4B MoE, seq 1024, batch 32 | Native bf16 tensor cores. Scale `seq_len`/experts up; watch O(L²) MLA memory. |
+
+**Multi-GPU is automatic.** `train.py` detects `jax.device_count()`, replicates the
+params + Adam state on every device, and shards each batch across them (GSPMD data
+parallelism). No flag needed — a single GPU is just the replicate-over-1 case.
+`batch_size` must be divisible by the device count (validated at startup). The 2x-T4
+run prints `Data-parallel over 2 devices (8 examples/device).`
+
+```bash
+# On Kaggle's 2x T4, this uses BOTH GPUs with no extra flags:
+python -m pipeline.prepare_data --config configs/kaggle_2xt4.yaml
+python -m pipeline.train        --config configs/kaggle_2xt4.yaml
+```
 
 ## How the pieces fit
 

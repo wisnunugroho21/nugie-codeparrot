@@ -21,6 +21,14 @@ MIXED PRECISION
     Governed entirely by model.compute_dtype (fp32 by default; set "bfloat16" on a
     GPU). Master weights stay fp32; logits/loss are fp32 for a stable softmax.
 
+MULTI-GPU (DATA PARALLEL)
+    Auto-detected from jax.device_count(): parameters + optimizer state are
+    REPLICATED across all visible devices, and each global batch is SHARDED along its
+    leading axis (so every GPU processes batch_size/n_devices examples). This is pure
+    GSPMD data parallelism — no code path branches on device count; a single device is
+    just the degenerate replicate-over-1 case. batch_size must be divisible by the
+    number of devices (checked at startup). Used by the 2x-T4 (Kaggle) config.
+
 Run:  python -m pipeline.train --config configs/tiny.yaml [--resume]
 """
 
@@ -33,6 +41,7 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import optax
+from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
 
 from kimi_linear_gdn2 import KimiLinear, count_params
 from multi_latent_attention.moe import update_router_bias
@@ -125,13 +134,16 @@ def eval_step(model: KimiLinear, batch: dict[str, jax.Array]):
     return tok_ce.sum(), jnp.array(tok_ce.size, jnp.float32)
 
 
-def evaluate_loss(model: KimiLinear, val_iter, steps: int) -> dict[str, float]:
+def evaluate_loss(model: KimiLinear, val_iter, steps: int, shard=None) -> dict[str, float]:
     """Mean CE / perplexity over `steps` val batches. Sets the model to eval mode so
-    any train-only behavior is disabled (harmless here; good hygiene)."""
+    any train-only behavior is disabled (harmless here; good hygiene). `shard`, if
+    given, places each batch on the data-parallel sharding used by the params."""
     model.eval()
     tot_ce, tot_tok = 0.0, 0.0
     for _ in range(steps):
         batch = _to_jax(next(val_iter))
+        if shard is not None:
+            batch = shard(batch)
         ce_sum, n = eval_step(model, batch)
         tot_ce += float(ce_sum)
         tot_tok += float(n)
@@ -171,6 +183,27 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
     print(f"Model params: {count_params(model):,}  "
           f"(compute_dtype={cfg.model.compute_dtype}, seq_len={cfg.data.seq_len})")
 
+    # --- data-parallel sharding (works for 1 device too) ---
+    devices = jax.devices()
+    n_dev = len(devices)
+    if tc.batch_size % n_dev != 0:
+        raise ValueError(
+            f"batch_size ({tc.batch_size}) must be divisible by the number of "
+            f"devices ({n_dev}) for data-parallel training.")
+    # AUTO axis type => classic GSPMD auto-partitioning, which resolves the sharded
+    # embedding gather / MoE scatter for us (Explicit sharding would demand per-op
+    # out-sharding annotations inside the model).
+    mesh = jax.make_mesh((n_dev,), ("data",), (AxisType.Auto,))
+    data_shard = NamedSharding(mesh, P("data"))  # split batch across devices
+    repl_shard = NamedSharding(mesh, P())        # replicate params/opt state
+    # Replicate the optimizer (params + Adam state) across all devices. `model` is a
+    # submodule of `optimizer`, so this replicates its params in place as well.
+    nnx.update(optimizer, jax.device_put(nnx.state(optimizer), repl_shard))
+    shard_batch = lambda b: jax.device_put(b, data_shard)  # noqa: E731
+    if n_dev > 1:
+        print(f"Data-parallel over {n_dev} devices "
+              f"({tc.batch_size // n_dev} examples/device).")
+
     # --- checkpoint manager (+ optional resume) ---
     ckpt = CheckpointManager(tc.ckpt_dir, keep=tc.keep_checkpoints)
     start_step = 0
@@ -183,7 +216,7 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
     tokens_per_step = tc.batch_size * cfg.data.seq_len
     running_ce = 0.0
     for step in range(start_step, tc.max_steps):
-        batch = _to_jax(next(train_iter))
+        batch = shard_batch(_to_jax(next(train_iter)))
         total, ce, aux_loss = train_step(model, optimizer, batch, tc.router_bias_lr)
         running_ce += float(ce)
 
@@ -198,7 +231,7 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
             running_ce, t0 = 0.0, time.time()
 
         if (step + 1) % tc.eval_every == 0:
-            m = evaluate_loss(model, val_iter, tc.eval_steps)
+            m = evaluate_loss(model, val_iter, tc.eval_steps, shard=shard_batch)
             print(f"  [eval] step {step + 1} | val_loss {m['val_loss']:.4f} | "
                   f"val_ppl {m['val_ppl']:.2f}", flush=True)
             t0 = time.time()  # don't count eval time against tok/s
