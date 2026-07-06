@@ -1,0 +1,11 @@
+# Generated data & checkpoints
+data/
+checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+.DS_Store
+
+# HF / Grain caches
+.cache/

@@ -1,0 +1,128 @@
+"""
+Stage 4: evaluation & sampling from a trained checkpoint.
+
+Restores the latest (or a chosen) Orbax checkpoint and does two things:
+
+  1. `--eval`     full-corpus validation loss + perplexity over the held-out split
+                  (or a capped number of batches via --max-batches).
+  2. `--generate` autoregressive code completion from a text prompt, using the
+                  model's streaming `generate` (GDN-2 fixed-size state + growing MLA
+                  latent cache), decoded back to text with the training tokenizer.
+
+Run:
+    python -m pipeline.evaluate --config configs/tiny.yaml --eval
+    python -m pipeline.evaluate --config configs/tiny.yaml --generate \
+        --prompt "def fibonacci(n):" --max-new-tokens 128
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+
+import flax.nnx as nnx
+import jax.numpy as jnp
+
+from pipeline import data as data_mod
+from pipeline.checkpointing import CheckpointManager
+from pipeline.config import ExperimentConfig
+from pipeline.tokenizer import build_tokenizer
+from pipeline.train import build_model, build_optimizer, eval_step
+
+
+def load_trained(cfg: ExperimentConfig, step: int | None = None):
+    """Rebuild the model + optimizer skeleton and restore checkpointed weights.
+    Returns (model, restored_step). We restore through the optimizer because that is
+    exactly what train.py checkpointed (params live inside it)."""
+    model = build_model(cfg, cfg.train.seed)
+    optimizer = build_optimizer(model, cfg)  # skeleton matching the saved pytree
+    ckpt = CheckpointManager(cfg.train.ckpt_dir, keep=cfg.train.keep_checkpoints)
+    restored = ckpt.restore(optimizer, step)
+    ckpt.close()
+    model.eval()
+    return model, restored
+
+
+# --------------------------------------------------------------------------- #
+def run_eval(cfg: ExperimentConfig, step: int | None, max_batches: int | None) -> None:
+    model, restored = load_trained(cfg, step)
+    print(f"Restored step {restored}. Evaluating validation split...")
+
+    total_windows = data_mod.num_windows(cfg.data.data_dir, "val", cfg.data.seq_len)
+    n_batches = total_windows // cfg.train.batch_size
+    if max_batches is not None:
+        n_batches = min(n_batches, max_batches)
+    if n_batches == 0:
+        raise ValueError("Not enough validation data for a single batch.")
+
+    val_iter = data_mod.make_loader(
+        cfg.data.data_dir, "val", cfg.data.seq_len, cfg.train.batch_size,
+        shuffle=False, repeat=False, seed=0, num_workers=0)
+
+    tot_ce, tot_tok = 0.0, 0.0
+    for i in range(n_batches):
+        batch = {k: jnp.asarray(v) for k, v in next(val_iter).items()}
+        ce_sum, n = eval_step(model, batch)
+        tot_ce += float(ce_sum)
+        tot_tok += float(n)
+        if (i + 1) % 20 == 0:
+            print(f"  {i + 1}/{n_batches} batches...", flush=True)
+
+    mean_ce = tot_ce / max(tot_tok, 1.0)
+    print("\n=== Validation ===")
+    print(f"  tokens     : {int(tot_tok):,}")
+    print(f"  cross-ent  : {mean_ce:.4f} nats")
+    print(f"  perplexity : {math.exp(mean_ce):.2f}")
+    print(f"  bits/token : {mean_ce / math.log(2):.4f}")
+
+
+# --------------------------------------------------------------------------- #
+def run_generate(cfg: ExperimentConfig, step: int | None, prompt: str,
+                 max_new_tokens: int) -> None:
+    model, restored = load_trained(cfg, step)
+    meta = data_mod.load_meta(cfg.data.data_dir)
+    tokenizer = build_tokenizer(
+        meta.get("tokenizer", cfg.data.tokenizer), meta.get("tokenizer_name",
+                                                            cfg.data.tokenizer_name))
+    print(f"Restored step {restored}. Generating...\n")
+
+    ids = tokenizer.encode(prompt) or [tokenizer.eos_id]
+    prompt_ids = jnp.asarray(ids, jnp.int32)[None, :]  # [1, P]
+
+    # Cache spans the whole prompt+continuation; must respect the MLA context cap.
+    max_len = min(len(ids) + max_new_tokens, cfg.model.max_seq_len)
+    gen = model.generate(prompt_ids, max_new_tokens=max_new_tokens, max_len=max_len)
+    continuation = tokenizer.decode(gen[0].tolist())
+
+    print("=== Prompt ===")
+    print(prompt)
+    print("\n=== Continuation ===")
+    print(continuation)
+
+
+# --------------------------------------------------------------------------- #
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Evaluate / sample from a checkpoint.")
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--step", type=int, default=None,
+                    help="Checkpoint step to load (default: latest).")
+    ap.add_argument("--eval", action="store_true", help="Compute validation loss/ppl.")
+    ap.add_argument("--max-batches", type=int, default=None,
+                    help="Cap the number of val batches in --eval.")
+    ap.add_argument("--generate", action="store_true", help="Sample a completion.")
+    ap.add_argument("--prompt", default="def hello_world():\n",
+                    help="Prompt text for --generate.")
+    ap.add_argument("--max-new-tokens", type=int, default=128)
+    args = ap.parse_args()
+
+    cfg = ExperimentConfig.load(args.config)
+    if not (args.eval or args.generate):
+        args.eval = True  # default action
+    if args.eval:
+        run_eval(cfg, args.step, args.max_batches)
+    if args.generate:
+        run_generate(cfg, args.step, args.prompt, args.max_new_tokens)
+
+
+if __name__ == "__main__":
+    main()
