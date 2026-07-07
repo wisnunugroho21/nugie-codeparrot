@@ -21,13 +21,16 @@ import argparse
 import math
 
 import flax.nnx as nnx
+import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from pipeline import data as data_mod
 from pipeline.checkpointing import CheckpointManager
 from pipeline.config import ExperimentConfig
 from pipeline.tokenizer import build_tokenizer
-from pipeline.train import build_model, build_optimizer, eval_step
+from pipeline.train import build_model, build_optimizer, make_eval_step
 
 
 def load_trained(cfg: ExperimentConfig, step: int | None = None):
@@ -59,10 +62,24 @@ def run_eval(cfg: ExperimentConfig, step: int | None, max_batches: int | None) -
         cfg.data.data_dir, "val", cfg.data.seq_len, cfg.train.batch_size,
         shuffle=False, repeat=False, seed=0, num_workers=0)
 
+    # Data-parallel eval matching train.py: replicate the params, shard each batch, and
+    # run the forward inside shard_map so the MoE dispatch stays device-local (no all-
+    # gather / OOM on multi-GPU). Degenerates to a plain single-device pass on 1 GPU.
+    devices = jax.devices()
+    n_dev = len(devices)
+    if cfg.train.batch_size % n_dev != 0:
+        raise ValueError(
+            f"batch_size ({cfg.train.batch_size}) must be divisible by the number of "
+            f"devices ({n_dev}).")
+    mesh = Mesh(np.asarray(devices), ("data",))
+    nnx.update(model, jax.device_put(nnx.state(model), NamedSharding(mesh, P())))
+    data_shard = NamedSharding(mesh, P("data"))
+    eval_step = make_eval_step(mesh)
+
     tot_ce, tot_tok = 0.0, 0.0
     for i in range(n_batches):
         batch = {k: jnp.asarray(v) for k, v in next(val_iter).items()}
-        ce_sum, n = eval_step(model, batch)
+        ce_sum, n = eval_step(model, jax.device_put(batch, data_shard))
         tot_ce += float(ce_sum)
         tot_tok += float(n)
         if (i + 1) % 20 == 0:

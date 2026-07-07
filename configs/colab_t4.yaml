@@ -15,7 +15,7 @@
 model:
   vocab_size: 32768
   d_model: 512
-  n_layers: 10             # MLA at indices 3, 7 (3:1 hybrid)
+  n_layers: 10 # MLA at indices 3, 7 (3:1 hybrid)
   full_attn_period: 4
   gdn_num_heads: 8
   gdn_head_k_dim: 64
@@ -42,7 +42,7 @@ data:
   tokenizer: codeparrot
   tokenizer_name: codeparrot/codeparrot
   seq_len: 512
-  num_workers: 2           # Colab usually exposes ~2 CPU cores
+  num_workers: 2 # Colab usually exposes ~2 CPU cores
 
 train:
   batch_size: 4
@@ -56,9 +56,9 @@ train:
   grad_clip: 1.0
   router_bias_lr: 0.001
   ckpt_dir: checkpoints/colab_t4
-  save_every: 2000
-  keep_checkpoints: 2      # Colab disk is small; keep few
-  log_every: 50
+  save_every: 100
+  keep_checkpoints: 2 # Colab disk is small; keep few
+  log_every: 20
   eval_every: 2000
   eval_steps: 100
   seed: 0

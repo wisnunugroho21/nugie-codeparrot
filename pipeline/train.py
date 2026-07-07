@@ -40,8 +40,31 @@ import time
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
-from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+# `shard_map` became a top-level `jax.shard_map` in recent JAX; fall back to its
+# experimental location on older releases.
+import inspect
+
+try:
+    from jax import shard_map as _shard_map_impl
+except ImportError:  # pragma: no cover
+    from jax.experimental.shard_map import shard_map as _shard_map_impl
+
+# Disable shard_map's varying-axis (a.k.a. replication) type checker: the GDN-2 token
+# mixer runs an internal `lax.scan` whose carry is varying over the "data" axis, which
+# the checker rejects (scan-vma). We own out_specs correctness explicitly via the
+# pmean/psum collectives below, so turning the check off is safe. The kwarg was renamed
+# check_rep -> check_vma across JAX versions; pick whichever this build exposes.
+_CHECK_KW = ("check_vma" if "check_vma" in inspect.signature(_shard_map_impl).parameters
+             else "check_rep")
+
+
+def shard_map(f, **kwargs):
+    return _shard_map_impl(f, **kwargs, **{_CHECK_KW: False})
+
 
 from kimi_linear_gdn2 import KimiLinear, count_params
 from multi_latent_attention.moe import update_router_bias
@@ -106,35 +129,96 @@ def loss_fn(model: KimiLinear, batch: dict[str, jax.Array]):
     return total, (ce, aux["aux_loss"], aux["group_sizes"])
 
 
-@nnx.jit
-def train_step(model: KimiLinear, optimizer: nnx.Optimizer,
-               batch: dict[str, jax.Array], router_bias_lr: float):
-    """One optimizer step + the non-gradient router-bias nudge. Mutates model and
-    optimizer in place (nnx tracks the mutations under jit)."""
-    (total, (ce, aux_loss, group_sizes)), grads = nnx.value_and_grad(
-        loss_fn, has_aux=True)(model, batch)
-    optimizer.update(model, grads)
-
-    # Aux-loss-free load balancing: nudge each MoE layer's router bias using this
-    # step's realized per-expert token counts (group_sizes[i] for layer i).
-    for i, layer in enumerate(model.layers):
-        moe = layer.channel_mixer
-        moe.router_bias.value = update_router_bias(
-            moe.router_bias.value, group_sizes[i], router_bias_lr)
-
-    return total, ce, aux_loss
+# Filter used to split the model into (graphdef, params, everything-else) for the
+# functional split/merge inside shard_map. `nnx.Param` are the differentiated weights;
+# the `...` catch-all keeps the rest (RMSNorm state, the MoE router_bias Variable, ...).
+_PARAM_FILTER = (nnx.Param, ...)
 
 
-@nnx.jit
-def eval_step(model: KimiLinear, batch: dict[str, jax.Array]):
-    """CE loss and token count for one val batch (no aux, no grad)."""
-    logits, _ = model(batch["input_ids"])
-    tok_ce = optax.softmax_cross_entropy_with_integer_labels(
-        logits, batch["target_ids"])  # [B,L]
-    return tok_ce.sum(), jnp.array(tok_ce.size, jnp.float32)
+def make_train_step(mesh: Mesh):
+    """Build the data-parallel train step bound to `mesh` (single axis "data").
+
+    The forward + backward runs inside `shard_map`, so each device processes ONLY its
+    shard of the batch and the MoE's token dispatch (argsort / ragged_dot / scatter-add
+    over the B*L token axis, see multi_latent_attention/moe.py) stays DEVICE-LOCAL.
+    That global permutation is unshardable along the batch axis, so plain GSPMD auto-
+    partitioning all-gathers every token onto one device — silently collapsing data
+    parallelism and OOMing large batches. Manual sharding keeps the experts replicated
+    and routes each device's own tokens instead.
+
+    Collectives across the "data" axis re-sync the replicas: gradients are averaged
+    (pmean) and the per-expert token counts are summed (psum) so every replica applies
+    an identical optimizer step AND identical router-bias nudge, keeping the replicated
+    params/router_bias bit-for-bit in sync.
+    """
+
+    @nnx.jit
+    def train_step(model: KimiLinear, optimizer: nnx.Optimizer,
+                   batch: dict[str, jax.Array], router_bias_lr: float):
+        graphdef, params, rest = nnx.split(model, *_PARAM_FILTER)
+
+        def _dp(params, rest, batch):
+            # Per-device forward/backward over this shard's local tokens.
+            def _loss(p):
+                return loss_fn(nnx.merge(graphdef, p, rest), batch)
+            (total, (ce, aux_loss, group_sizes)), grads = jax.value_and_grad(
+                _loss, has_aux=True)(params)
+            # Re-sync replicas: average grads/loss, SUM the per-expert counts so the
+            # router-bias update sees the global batch's load (not one shard's).
+            grads = jax.lax.pmean(grads, "data")
+            total = jax.lax.pmean(total, "data")
+            ce = jax.lax.pmean(ce, "data")
+            aux_loss = jax.lax.pmean(aux_loss, "data")
+            group_sizes = jax.lax.psum(group_sizes, "data")
+            return grads, total, ce, aux_loss, group_sizes
+
+        grads, total, ce, aux_loss, group_sizes = shard_map(
+            _dp, mesh=mesh,
+            in_specs=(P(), P(), P("data")),      # params/rest replicated; batch sharded
+            out_specs=(P(), P(), P(), P(), P()),  # all outputs already replica-reduced
+        )(params, rest, batch)
+
+        # Grads/counts are identical across replicas now, so these replicated updates
+        # keep params + router_bias in sync on every device.
+        optimizer.update(model, grads)
+        for i, layer in enumerate(model.layers):
+            moe = layer.channel_mixer
+            moe.router_bias.value = update_router_bias(
+                moe.router_bias.value, group_sizes[i], router_bias_lr)
+
+        return total, ce, aux_loss
+
+    return train_step
 
 
-def evaluate_loss(model: KimiLinear, val_iter, steps: int, shard=None) -> dict[str, float]:
+def make_eval_step(mesh: Mesh):
+    """Build the data-parallel eval step bound to `mesh` (mirrors make_train_step).
+    Runs the forward under shard_map for the same reason (device-local MoE dispatch,
+    no all-gather / OOM), then psums the CE sum and token count to global totals."""
+
+    @nnx.jit
+    def eval_step(model: KimiLinear, batch: dict[str, jax.Array]):
+        graphdef, params, rest = nnx.split(model, *_PARAM_FILTER)
+
+        def _fwd(params, rest, batch):
+            logits, _ = nnx.merge(graphdef, params, rest)(batch["input_ids"])
+            tok_ce = optax.softmax_cross_entropy_with_integer_labels(
+                logits, batch["target_ids"])  # [B_local, L]
+            ce_sum = jax.lax.psum(tok_ce.sum(), "data")
+            n = jax.lax.psum(jnp.array(tok_ce.size, jnp.float32), "data")
+            return ce_sum, n
+
+        return shard_map(
+            _fwd, mesh=mesh,
+            in_specs=(P(), P(), P("data")),
+            out_specs=(P(), P()),
+        )(params, rest, batch)
+
+    return eval_step
+
+
+def evaluate_loss(model: KimiLinear, eval_step, val_iter, steps: int,
+                  shard=None) -> dict[str, float]:
     """Mean CE / perplexity over `steps` val batches. Sets the model to eval mode so
     any train-only behavior is disabled (harmless here; good hygiene). `shard`, if
     given, places each batch on the data-parallel sharding used by the params."""
@@ -190,16 +274,19 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
         raise ValueError(
             f"batch_size ({tc.batch_size}) must be divisible by the number of "
             f"devices ({n_dev}) for data-parallel training.")
-    # AUTO axis type => classic GSPMD auto-partitioning, which resolves the sharded
-    # embedding gather / MoE scatter for us (Explicit sharding would demand per-op
-    # out-sharding annotations inside the model).
-    mesh = jax.make_mesh((n_dev,), ("data",), (AxisType.Auto,))
+    # Manual (shard_map) data parallelism: one "data" axis over all devices. train/eval
+    # steps run the model forward INSIDE shard_map so the MoE's global token dispatch
+    # stays device-local (GSPMD auto-partitioning would all-gather it onto one GPU —
+    # collapsing the second device and OOMing the batch). See make_train_step.
+    mesh = Mesh(np.asarray(devices), ("data",))
     data_shard = NamedSharding(mesh, P("data"))  # split batch across devices
     repl_shard = NamedSharding(mesh, P())        # replicate params/opt state
     # Replicate the optimizer (params + Adam state) across all devices. `model` is a
     # submodule of `optimizer`, so this replicates its params in place as well.
     nnx.update(optimizer, jax.device_put(nnx.state(optimizer), repl_shard))
     shard_batch = lambda b: jax.device_put(b, data_shard)  # noqa: E731
+    train_step = make_train_step(mesh)
+    eval_step = make_eval_step(mesh)
     if n_dev > 1:
         print(f"Data-parallel over {n_dev} devices "
               f"({tc.batch_size // n_dev} examples/device).")
@@ -231,7 +318,8 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
             running_ce, t0 = 0.0, time.time()
 
         if (step + 1) % tc.eval_every == 0:
-            m = evaluate_loss(model, val_iter, tc.eval_steps, shard=shard_batch)
+            m = evaluate_loss(model, eval_step, val_iter, tc.eval_steps,
+                              shard=shard_batch)
             print(f"  [eval] step {step + 1} | val_loss {m['val_loss']:.4f} | "
                   f"val_ppl {m['val_ppl']:.2f}", flush=True)
             t0 = time.time()  # don't count eval time against tok/s
