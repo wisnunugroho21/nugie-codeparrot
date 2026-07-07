@@ -45,7 +45,7 @@ data:
   num_workers: 2 # Colab usually exposes ~2 CPU cores
 
 train:
-  batch_size: 4
+  batch_size: 16
   max_steps: 40000
   lr: 0.0003
   min_lr: 0.00003
