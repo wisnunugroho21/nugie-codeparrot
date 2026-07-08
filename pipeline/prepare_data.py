@@ -14,7 +14,7 @@ WHY PACKED MEMMAP
     slices contiguous (seq_len+1) windows — O(1) per example, zero re-tokenization.
 
 SOURCES
-    source="huggingface": streams `codeparrot/codeparrot-clean` from the Hub. The
+    source="huggingface": streams `codeparrot/codeparrot-train-v2-near-dedup` from the Hub. The
         corpus has only a train split, so we carve validation out of the head of the
         stream (first num_val_docs) and take training docs after it.
     source="synthetic": writes random token ids locally — no network, no tokenizer
@@ -81,8 +81,9 @@ def _hf_doc_tokens(docs, tokenizer, text_field: str, dtype: np.dtype):
             print(f"  tokenized {i + 1} docs...", flush=True)
 
 
-def _synthetic_tokens(n_tokens: int, vocab_size: int, eos_id: int, dtype: np.dtype,
-                      seed: int):
+def _synthetic_tokens(
+    n_tokens: int, vocab_size: int, eos_id: int, dtype: np.dtype, seed: int
+):
     """Yield random token ids in ~200-token 'documents' ended by EOS. Purely for
     exercising the pipeline without a network or tokenizer download."""
     rng = np.random.default_rng(seed)
@@ -107,32 +108,45 @@ def prepare(cfg: ExperimentConfig) -> None:
         print(f"[synthetic] vocab={vocab_size} dtype={dtype}")
         n_val = _write_stream(
             val_bin,
-            _synthetic_tokens(cfg.data.synthetic_val_tokens, vocab_size, eos_id, dtype, seed=1),
+            _synthetic_tokens(
+                cfg.data.synthetic_val_tokens, vocab_size, eos_id, dtype, seed=1
+            ),
             dtype,
         )
         n_train = _write_stream(
             train_bin,
-            _synthetic_tokens(cfg.data.synthetic_train_tokens, vocab_size, eos_id, dtype, seed=2),
+            _synthetic_tokens(
+                cfg.data.synthetic_train_tokens, vocab_size, eos_id, dtype, seed=2
+            ),
             dtype,
         )
     elif cfg.data.source == "huggingface":
         from datasets import load_dataset
 
         tokenizer = build_tokenizer(cfg.data.tokenizer, cfg.data.tokenizer_name)
-        vocab_size, eos_id, tok_name = tokenizer.vocab_size, tokenizer.eos_id, cfg.data.tokenizer
+        vocab_size, eos_id, tok_name = (
+            tokenizer.vocab_size,
+            tokenizer.eos_id,
+            cfg.data.tokenizer,
+        )
         dtype = _dtype_for(vocab_size)
-        print(f"[huggingface] {cfg.data.hf_dataset} tok={cfg.data.tokenizer} "
-              f"vocab={vocab_size} dtype={dtype}")
+        print(
+            f"[huggingface] {cfg.data.hf_dataset} tok={cfg.data.tokenizer} "
+            f"vocab={vocab_size} dtype={dtype}"
+        )
 
-        stream = load_dataset(cfg.data.hf_dataset, split=cfg.data.hf_train_split,
-                              streaming=True)
+        stream = load_dataset(
+            cfg.data.hf_dataset, split=cfg.data.hf_train_split, streaming=True
+        )
 
         # Val = head of the stream; train = the docs after it (disjoint).
         val_docs = stream.take(cfg.data.num_val_docs) if cfg.data.num_val_docs else []
         print("Tokenizing validation split...")
         n_val = _write_stream(
             val_bin,
-            _hf_doc_tokens(val_docs, tokenizer, cfg.data.text_field, dtype), dtype)
+            _hf_doc_tokens(val_docs, tokenizer, cfg.data.text_field, dtype),
+            dtype,
+        )
 
         train_stream = stream.skip(cfg.data.num_val_docs or 0)
         if cfg.data.num_train_docs:
@@ -140,13 +154,17 @@ def prepare(cfg: ExperimentConfig) -> None:
         print("Tokenizing training split...")
         n_train = _write_stream(
             train_bin,
-            _hf_doc_tokens(train_stream, tokenizer, cfg.data.text_field, dtype), dtype)
+            _hf_doc_tokens(train_stream, tokenizer, cfg.data.text_field, dtype),
+            dtype,
+        )
     else:
         raise ValueError(f"Unknown data.source: {cfg.data.source!r}")
 
     if vocab_size != cfg.model.vocab_size:
-        print(f"WARNING: tokenizer vocab {vocab_size} != model.vocab_size "
-              f"{cfg.model.vocab_size}. Set model.vocab_size = {vocab_size} in the YAML.")
+        print(
+            f"WARNING: tokenizer vocab {vocab_size} != model.vocab_size "
+            f"{cfg.model.vocab_size}. Set model.vocab_size = {vocab_size} in the YAML."
+        )
 
     meta = {
         "dtype": np.dtype(dtype).name,

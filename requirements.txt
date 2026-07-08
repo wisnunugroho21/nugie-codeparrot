@@ -6,7 +6,7 @@ orbax-checkpoint>=0.6
 
 # Data pipeline
 grain>=0.2
-datasets>=2.19          # streams codeparrot/codeparrot-clean from the HF Hub
+datasets>=2.19          # streams codeparrot/codeparrot-train-v2-near-dedup from the HF Hub
 transformers>=4.40      # the pretrained codeparrot BPE tokenizer
 numpy>=1.26
 pyyaml>=6.0

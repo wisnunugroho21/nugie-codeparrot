@@ -38,7 +38,7 @@ class DataConfig:
     #   "synthetic":   generate random tokens locally (no network) so the whole
     #                  pipeline can be exercised end-to-end offline / in CI.
     source: str = "huggingface"
-    hf_dataset: str = "codeparrot/codeparrot-clean"
+    hf_dataset: str = "codeparrot/codeparrot-train-v2-near-dedup"
     hf_train_split: str = "train"
     hf_val_split: str = "train"  # codeparrot-clean has no val split; we carve one out
     text_field: str = "content"

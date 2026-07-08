@@ -9,9 +9,9 @@
 #       --prompt "def quicksort(arr):" --max-new-tokens 128
 
 model:
-  vocab_size: 32768      # MUST match the codeparrot tokenizer (checked at startup)
+  vocab_size: 32768 # MUST match the codeparrot tokenizer (checked at startup)
   d_model: 512
-  n_layers: 12           # MLA at indices 3, 7, 11 (3:1 hybrid)
+  n_layers: 12 # MLA at indices 3, 7, 11 (3:1 hybrid)
   full_attn_period: 4
   gdn_num_heads: 8
   gdn_head_k_dim: 64
@@ -31,14 +31,14 @@ model:
 data:
   data_dir: data/codeparrot
   source: huggingface
-  hf_dataset: codeparrot/codeparrot-clean
+  hf_dataset: codeparrot/codeparrot-train-v2-near-dedup
   hf_train_split: train
   text_field: content
-  num_train_docs: 50000    # raise for a real run (full corpus is enormous)
+  num_train_docs: 50000 # raise for a real run (full corpus is enormous)
   num_val_docs: 1000
   tokenizer: codeparrot
   tokenizer_name: codeparrot/codeparrot
-  seq_len: 512             # multiple of gdn_chunk_size (64), <= max_seq_len
+  seq_len: 512 # multiple of gdn_chunk_size (64), <= max_seq_len
   num_workers: 4
 
 train:

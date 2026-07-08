@@ -19,7 +19,7 @@
 model:
   vocab_size: 32768
   d_model: 512
-  n_layers: 10             # MLA at indices 3, 7 (3:1 hybrid)
+  n_layers: 10 # MLA at indices 3, 7 (3:1 hybrid)
   full_attn_period: 4
   gdn_num_heads: 8
   gdn_head_k_dim: 64
@@ -39,19 +39,19 @@ model:
 data:
   data_dir: data/codeparrot
   source: huggingface
-  hf_dataset: codeparrot/codeparrot-clean
+  hf_dataset: codeparrot/codeparrot-train-v2-near-dedup
   text_field: content
   num_train_docs: 100000
   num_val_docs: 1000
   tokenizer: codeparrot
   tokenizer_name: codeparrot/codeparrot
   seq_len: 512
-  num_workers: 4           # Kaggle exposes ~4 CPU cores
+  num_workers: 4 # Kaggle exposes ~4 CPU cores
 
 train:
-  batch_size: 16           # 8 per GPU across the 2 T4s (must be divisible by 2)
+  batch_size: 16 # 8 per GPU across the 2 T4s (must be divisible by 2)
   max_steps: 40000
-  lr: 0.0004               # slightly higher LR for the 2x-larger global batch
+  lr: 0.0004 # slightly higher LR for the 2x-larger global batch
   min_lr: 0.00004
   warmup_steps: 1000
   weight_decay: 0.1
@@ -60,9 +60,9 @@ train:
   grad_clip: 1.0
   router_bias_lr: 0.001
   ckpt_dir: checkpoints/kaggle_2xt4
-  save_every: 2000
+  save_every: 25
   keep_checkpoints: 2
-  log_every: 50
+  log_every: 25
   eval_every: 2000
   eval_steps: 100
   seed: 0

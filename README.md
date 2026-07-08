@@ -61,7 +61,7 @@ python -m pipeline.evaluate     --config configs/tiny.yaml --generate --prompt "
 
 ## Real training on CodeParrot
 
-The `base` config streams `codeparrot/codeparrot-clean` from the HF Hub and uses the
+The `base` config streams `codeparrot/codeparrot-train-v2-near-dedup` from the HF Hub and uses the
 pretrained `codeparrot/codeparrot` BPE tokenizer (vocab 32768).
 
 ```bash
