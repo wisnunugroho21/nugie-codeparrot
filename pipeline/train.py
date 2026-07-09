@@ -71,6 +71,7 @@ from multi_latent_attention.moe import update_router_bias
 from pipeline import data as data_mod
 from pipeline.checkpointing import CheckpointManager
 from pipeline.config import ExperimentConfig
+from pipeline.optimizer import make_optimizer
 
 
 # --------------------------------------------------------------------------- #
@@ -91,30 +92,21 @@ def build_schedule(tc) -> optax.Schedule:
     )
 
 
-def _weight_decay_mask(params):
-    """True on parameters that should be decayed: only >=2-D weight matrices. Norm
-    scales, biases and the 1-D GDN-2 decay params (A_log is 2-D but is a gate, not a
-    weight matrix — still, treating >=2D uniformly is the conventional choice) are
-    left out. Operates on the raw-array pytree Optax sees."""
-    return jax.tree.map(lambda p: jnp.ndim(p) >= 2, params)
-
-
 def build_optimizer(model: KimiLinear, cfg: ExperimentConfig) -> nnx.Optimizer:
+    """Global-norm clip -> Muon (hidden weight matrices) / AdamW (everything else),
+    the Moonlight recipe (see pipeline/optimizer.py). Muon's consistent-RMS scaling
+    keeps the same LR scale as the old plain-AdamW setup, so tc.lr is unchanged; weight
+    decay now touches only the Muon-side matrices (not embed/head/norms/biases)."""
     tc = cfg.train
-    tx = optax.chain(
-        optax.clip_by_global_norm(tc.grad_clip),
-        optax.adamw(
-            learning_rate=build_schedule(tc),
-            b1=tc.beta1,
-            b2=tc.beta2,
-            eps=tc.eps,
-            weight_decay=tc.weight_decay,
-            mask=_weight_decay_mask,
-        ),
+    return make_optimizer(
+        model,
+        build_schedule(tc),
+        weight_decay=tc.weight_decay,
+        clip_norm=tc.grad_clip,
+        adam_b1=tc.beta1,
+        adam_b2=tc.beta2,
+        eps=tc.eps,
     )
-    # Differentiate/optimize ONLY nnx.Param leaves; the MoE router_bias (nnx.Variable)
-    # is deliberately excluded — it is updated by the aux-loss-free rule instead.
-    return nnx.Optimizer(model, tx, wrt=nnx.Param)
 
 
 # --------------------------------------------------------------------------- #

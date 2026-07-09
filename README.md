@@ -34,7 +34,8 @@ pipeline/
   tokenizer.py     # byte-level or pretrained codeparrot BPE tokenizer
   prepare_data.py  # stage 1: tokenize CodeParrot -> packed memmap (.bin) + meta.json
   data.py          # stage 2: Grain random-access source + shuffled/batched loader
-  train.py         # stage 3: Optax AdamW loop + router-bias update + Orbax checkpoints
+  train.py         # stage 3: Optax Muon/AdamW loop + router-bias update + Orbax checkpoints
+  optimizer.py     # Muon (matrices) / AdamW (rest) split — the Moonlight recipe
   evaluate.py      # stage 4: restore checkpoint -> val loss/ppl + code generation
   checkpointing.py # Orbax CheckpointManager glue for the nnx optimizer state
 ```
@@ -111,11 +112,15 @@ by an EOS id) into one long stream on disk. `data.py` memory-maps it and exposes
 repeats, and prefetches. `seq_len` must be a multiple of `gdn_chunk_size` (64) and
 `≤ max_seq_len`; the config validates this at startup.
 
-**Optimization (Optax).** AdamW with linear-warmup → cosine-decay LR and global-norm
-gradient clipping. Weight decay is masked to weight matrices only. The loss is
-next-token cross-entropy **plus** the MoE load-balancing aux loss the model returns.
-After each step, the DeepSeek-V3 **aux-loss-free** router bias is nudged per layer
-from the realized expert token counts — a non-gradient update.
+**Optimization (Optax).** The Moonlight recipe (`optimizer.py`): **Muon** on the hidden
+weight matrices (all Linear kernels + the stacked MoE expert tensors), **AdamW** on
+everything else (embedding, LM head, RMSNorm gains, biases, and the GDN-2 decay params).
+Muon's consistent-RMS scaling means the AdamW learning rate carries over unchanged. A
+linear-warmup → cosine-decay LR schedule and global-norm gradient clipping wrap both;
+weight decay applies only to the Muon-side matrices. The loss is next-token cross-entropy
+**plus** the MoE load-balancing aux loss the model returns. After each step, the
+DeepSeek-V3 **aux-loss-free** router bias is nudged per layer from the realized expert
+token counts — a non-gradient update.
 
 **Checkpointing (Orbax).** The entire `nnx.Optimizer` (model params incl. the MoE
 router bias, Optax state, and step) is split into its array state and saved by an
