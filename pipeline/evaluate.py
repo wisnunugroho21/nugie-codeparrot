@@ -30,20 +30,19 @@ from pipeline import data as data_mod
 from pipeline.checkpointing import CheckpointManager
 from pipeline.config import ExperimentConfig
 from pipeline.tokenizer import build_tokenizer
-from pipeline.train import build_model, build_optimizer, make_eval_step
+from pipeline.train import build_model, make_eval_step
 
 
 def load_trained(cfg: ExperimentConfig, step: int | None = None):
-    """Rebuild the model + optimizer skeleton and restore checkpointed weights.
-    Returns (model, restored_step). We restore through the optimizer because that is
-    exactly what train.py checkpointed (params live inside it)."""
-    model = build_model(cfg, cfg.train.seed)
-    optimizer = build_optimizer(model, cfg)  # skeleton matching the saved pytree
+    """Rebuild the model skeleton and restore its checkpointed weights.
+    Returns (model, restored_step). Evaluation only needs the `model` item of the
+    composite checkpoint; the optimizer/rngs/train_iterator items are left untouched."""
+    model = build_model(cfg, nnx.Rngs(cfg.train.seed))
     ckpt = CheckpointManager(cfg.train.ckpt_dir, keep=cfg.train.keep_checkpoints)
-    restored = ckpt.restore(optimizer, step)
+    restored_step, _ = ckpt.restore(step, model=model)
     ckpt.close()
     model.eval()
-    return model, restored
+    return model, restored_step
 
 
 # --------------------------------------------------------------------------- #

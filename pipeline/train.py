@@ -76,8 +76,8 @@ from pipeline.config import ExperimentConfig
 # --------------------------------------------------------------------------- #
 #  Model / optimizer construction (shared with evaluate.py).
 # --------------------------------------------------------------------------- #
-def build_model(cfg: ExperimentConfig, seed: int) -> KimiLinear:
-    return KimiLinear(cfg.model, rngs=nnx.Rngs(seed))
+def build_model(cfg: ExperimentConfig, rngs: nnx.Rngs) -> KimiLinear:
+    return KimiLinear(cfg.model, rngs=rngs)
 
 
 def build_schedule(tc) -> optax.Schedule:
@@ -262,7 +262,10 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
         shuffle=False, repeat=True, seed=0, num_workers=0)
 
     # --- model + optimizer ---
-    model = build_model(cfg, tc.seed)
+    # Keep the Rngs object around (not just the seed): it is checkpointed alongside
+    # the model/optimizer so a resumed run continues the same random stream.
+    rngs = nnx.Rngs(tc.seed)
+    model = build_model(cfg, rngs)
     optimizer = build_optimizer(model, cfg)
     print(f"Model params: {count_params(model):,}  "
           f"(compute_dtype={cfg.model.compute_dtype}, seq_len={cfg.data.seq_len})")
@@ -281,9 +284,12 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
     mesh = Mesh(np.asarray(devices), ("data",))
     data_shard = NamedSharding(mesh, P("data"))  # split batch across devices
     repl_shard = NamedSharding(mesh, P())        # replicate params/opt state
-    # Replicate the optimizer (params + Adam state) across all devices. `model` is a
-    # submodule of `optimizer`, so this replicates its params in place as well.
-    nnx.update(optimizer, jax.device_put(nnx.state(optimizer), repl_shard))
+    # Replicate the model params, the Adam optimizer state, and the rng stream across
+    # all devices. (In this Flax version nnx.Optimizer does NOT nest the model, so the
+    # two must be replicated explicitly.) This also fixes the sharding of the abstract
+    # targets used on checkpoint restore below.
+    for obj in (model, optimizer, rngs):
+        nnx.update(obj, jax.device_put(nnx.state(obj), repl_shard))
     shard_batch = lambda b: jax.device_put(b, data_shard)  # noqa: E731
     train_step = make_train_step(mesh)
     eval_step = make_eval_step(mesh)
@@ -295,8 +301,10 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
     ckpt = CheckpointManager(tc.ckpt_dir, keep=tc.keep_checkpoints)
     start_step = 0
     if resume and ckpt.latest_step() is not None:
-        start_step = ckpt.restore(optimizer) + 1
-        print(f"Resumed from step {start_step - 1}")
+        restored_step, train_iter = ckpt.restore(
+            model=model, optimizer=optimizer, rngs=rngs, train_iterator=train_iter)
+        start_step = restored_step + 1
+        print(f"Resumed from step {restored_step}")
 
     # --- loop ---
     t0 = time.time()
@@ -325,7 +333,8 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
             t0 = time.time()  # don't count eval time against tok/s
 
         if (step + 1) % tc.save_every == 0:
-            ckpt.save(step, optimizer)
+            ckpt.save(step, model=model, optimizer=optimizer, rngs=rngs,
+                      train_iterator=train_iter)
             # Block until the async save commits BEFORE training resumes. Orbax pins the
             # full fp32 optimizer state (params + Adam m/v) on-device until the save
             # finishes; letting the next steps run concurrently stacks their working set
@@ -336,7 +345,8 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
             t0 = time.time()  # don't count save time against tok/s
 
     # final checkpoint
-    ckpt.save(tc.max_steps - 1, optimizer)
+    ckpt.save(tc.max_steps - 1, model=model, optimizer=optimizer, rngs=rngs,
+              train_iterator=train_iter)
     ckpt.wait_until_finished()
     print(f"Training complete. Final checkpoint at step {tc.max_steps - 1}.")
     ckpt.close()
