@@ -175,8 +175,10 @@ def make_train_step(mesh: Mesh):
         optimizer.update(model, grads)
         for i, layer in enumerate(model.layers):
             moe = layer.channel_mixer
-            moe.router_bias.value = update_router_bias(
-                moe.router_bias.value, group_sizes[i], router_bias_lr)
+            moe.router_bias.set_value(
+                update_router_bias(
+                    moe.router_bias.get_value(), group_sizes[i], router_bias_lr)
+            )
 
         return total, ce, aux_loss
 
