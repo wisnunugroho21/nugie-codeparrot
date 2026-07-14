@@ -91,6 +91,7 @@ class KimiLinearConfig:
     #   multiple of this C (it reshapes L into L/C chunks). Keep seq_len % C == 0.
     gdn_conv_size: int = 4  # short-conv kernel width
     gdn_expanded_erase: bool = False  # erase gate in [0,2] (neg-eigenvalue variant)
+    gdn_core: str = "centered"  # which GDN-2 chunkwise core computes each head (paper: "chunkwise")
 
     # --- MLA full-attention layers (NoPE) — see multi_latent_attention/attention.py ---
     mla_num_q_heads: int = 8  # query heads
@@ -168,6 +169,7 @@ class DecoderLayer(nnx.Module):
                 conv_size=cfg.gdn_conv_size,
                 expanded_erase=cfg.gdn_expanded_erase,
                 compute_dtype=cfg.cdtype,
+                core=cfg.gdn_core,
                 rngs=rngs,
             )
 

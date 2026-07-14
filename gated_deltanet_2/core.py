@@ -160,8 +160,11 @@ backward is only needed for a fused Triton/Pallas kernel.
 
 Shape conventions (one head): q, k, g, b: [L, dk]; v, w: [L, dv];
 S0: [dk, dv]. Public entry points add leading [B, H] axes via vmap.
-All math runs in fp32 (paper App. D).
+All math runs in fp32 (paper App. D). Every core is verified against
+_recurrent_single and an independent float64 oracle in test_rule.py.
 """
+
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -274,9 +277,10 @@ def _chunkwise_single_faithful(
     L, dk = k.shape
     dv = v.shape[-1]
     C = chunk_size
-    if L % C:
+    if C <= 0 or L % C:
         raise ValueError(
-            f"sequence length L={L} must be divisible by chunk_size={C}")
+            f"chunk_size={C} must be a positive divisor of the sequence "
+            f"length L={L}")
     N = L // C  # number of chunks
 
     def to_chunks(x):
@@ -445,9 +449,10 @@ def _chunkwise_single_stacked_RHS_solve(
     L, dk = k.shape
     dv = v.shape[-1]
     C = chunk_size
-    if L % C:
+    if C <= 0 or L % C:
         raise ValueError(
-            f"sequence length L={L} must be divisible by chunk_size={C}")
+            f"chunk_size={C} must be a positive divisor of the sequence "
+            f"length L={L}")
     N = L // C  # number of chunks
 
     def to_chunks(x):
@@ -507,15 +512,34 @@ def _chunkwise_single_stacked_RHS_solve(
     T = jnp.tril(Ebar @ Kbar.swapaxes(-1, -2), k=-1)
 
     # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē,  U = (I + T)^{-1} Z.
-    # Residuals obey ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38): each
-    # edit first accounts for every earlier edit it partially erases.
-    # Stacked: (I + T) R = Z − Ē S0. I + T is unit lower-triangular, and Y
-    # and U solve the SAME system with different right-hand sides (row
-    # recurrences Eqs. 45/46), so ONE batched forward substitution over the
-    # stacked RHS [Ē | Z] yields both. The explicit inverse A = (I + T)^{-1}
-    # is never materialized: that would cost a C-RHS solve plus two matmuls
-    # and is numerically worse than solving directly.
-    # Both are independent of S0 — that is what lets all chunks precompute
+    #
+    # HOW Eq. 21/34 and Eq. 22/34 WORK. The chunk's residuals obey
+    # ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38): before edit r can be
+    # applied, it must subtract its overlap T_rs with every EARLIER edit s it
+    # partially erases. Stacking the C rows turns that chain of corrections
+    # into one linear system, (I + T) R = Z − Ē S0 (Eq. 39). T is strictly
+    # lower triangular (causality), so I + T is unit lower-triangular and
+    # invertible by construction — Eq. 21/34 defines A = (I + T)^{-1}, and
+    # Eq. 22/34 pushes A onto the two S0-independent right-hand sides:
+    # Y = A Ē (erase side), U = A Z (write side), so that later
+    # R = U − Y S0 assembles the residuals for ANY chunk-entry state.
+    #
+    # HOW THE ROW RECURRENCES OF App. A.4 WORK. Expanding (I + T) Y = Ē and
+    # (I + T) U = Z row by row gives
+    #     y_rᵀ = ē_rᵀ − Σ_{s<r} (ē_rᵀ k̄_s) y_sᵀ,      Eq. 45
+    #     u_rᵀ = z_rᵀ − Σ_{s<r} (ē_rᵀ k̄_s) u_sᵀ,      Eq. 46
+    # i.e. row r starts from its own factor (ē_r or z_r) and subtracts each
+    # earlier, ALREADY-CORRECTED row s weighted by the overlap T_rs = ē_rᵀ k̄_s.
+    # Computing row 1, then row 2 from row 1, then row 3 from rows 1-2, ... is
+    # exactly forward substitution — solve_triangular below runs that C-step
+    # chain in one call. Both recurrences share the SAME coefficients T and
+    # differ only in the starting vectors, which is why one solve over the
+    # stacked RHS [Ē | Z] yields both auxiliaries at once (App. A.4: "the same
+    # WY inverse can be shared by the erase-side and write-side computations").
+    #
+    # The explicit inverse A is never materialized: that would cost a C-RHS
+    # solve plus two matmuls and is numerically worse than solving directly.
+    # Y and U are independent of S0 — that is what lets all chunks precompute
     # them in parallel before the sequential scan.
     YU = jax.scipy.linalg.solve_triangular(
         eye + T, jnp.concatenate([Ebar, Z], axis=-1),
@@ -597,7 +621,8 @@ def _chunkwise_single_centered(
     exp(G_C − G_r), so all within-chunk exponents are shifted by c = G_C/2
     per channel:
       * the shift cancels exactly wherever two centered factors meet
-        (T, A_qk, and K_tail is formed directly in log-space);
+        (T and A_qk); K_tail sidesteps it entirely, being formed directly
+        in log-space as exp(G_C − G);
       * it survives only where an absolute γ meets the state (Y S0, Q_γ S0),
         where it is re-attached by pre-scaling S0 with diag(exp(c)),
         exp(c) ≤ 1 — always safe.
@@ -611,9 +636,10 @@ def _chunkwise_single_centered(
     L, dk = k.shape
     dv = v.shape[-1]
     C = chunk_size
-    if L % C:
+    if C <= 0 or L % C:
         raise ValueError(
-            f"sequence length L={L} must be divisible by chunk_size={C}")
+            f"chunk_size={C} must be a positive divisor of the sequence "
+            f"length L={L}")
     N = L // C  # number of chunks
 
     def to_chunks(x):
@@ -665,13 +691,12 @@ def _chunkwise_single_centered(
     # Overlap of edit r with the decayed write s; centering cancels here.
     T = jnp.tril(Ebar @ Kbar.swapaxes(-1, -2), k=-1)
 
-    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē (erase side) and
-    # U = (I + T)^{-1} Z (write side) — the closed form of the causal chain
-    # of corrections ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38).
-    # Same triangular system, two right-hand sides (Eqs. 45/46): one batched
-    # forward substitution over the stacked RHS [Ē | Z], no explicit inverse
-    # materialized. Both are S0-independent, hence precomputable for all
-    # chunks in parallel.
+    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē,  U = (I + T)^{-1} Z — the WY
+    # auxiliaries, one forward substitution over the stacked RHS [Ē | Z].
+    # The row recurrences Eqs. 45/46 share the coefficients T, so one solve
+    # yields both; see _chunkwise_single_stacked_RHS_solve for the full
+    # derivation. Y and U are independent of S0 — that is what lets all
+    # chunks precompute them in parallel before the sequential scan.
     YU = jax.scipy.linalg.solve_triangular(
         eye + T, jnp.concatenate([Ebar, Z], axis=-1),
         lower=True, unit_diagonal=True,
@@ -759,9 +784,10 @@ def _chunkwise_single_pairwise(
     L, dk = k.shape
     dv = v.shape[-1]
     C = chunk_size
-    if L % C:
+    if C <= 0 or L % C:
         raise ValueError(
-            f"sequence length L={L} must be divisible by chunk_size={C}")
+            f"chunk_size={C} must be a positive divisor of the sequence "
+            f"length L={L}")
     N = L // C  # number of chunks
 
     def to_chunks(x):
@@ -782,6 +808,9 @@ def _chunkwise_single_pairwise(
     # coefficient of Eq. 23/40. γ_C = exp(G_C) ≤ 1 never overflows. [N, dk]
     G_C = G[:, -1]
     gamma_C = jnp.exp(G_C)
+
+    # Eq. 8:  e = b ⊙ k — erase directions, shared by T and Ē.   [N, C, dk]
+    e = b * k
 
     # Pairwise log-decay differences G_r − G_s for every (r, s) pair and key
     # channel — the exponent of the Diag(γ_r/γ_s) factor in Eqs. 21/25.
@@ -806,7 +835,7 @@ def _chunkwise_single_pairwise(
     # Same entries as tril(Ē K̄ᵀ, −1), but the decay enters as a bounded
     # per-triple factor instead of two unbounded row/column scalings — an
     # einsum with a [C, C, dk] operand, not a matmul.            [N, C, C]
-    T = jnp.tril(jnp.einsum('nrc,nsc,nrsc->nrs', b * k, k, D_incl), k=-1)
+    T = jnp.tril(jnp.einsum('nrc,nsc,nrsc->nrs', e, k, D_incl), k=-1)
 
     # Eq. 25/43:  (A_qk)_rs = q_rᵀ Diag(γ_r/γ_s) k_s, s ≤ r — decay-aware
     # causal attention scores, same pairwise construction (diagonal
@@ -819,7 +848,7 @@ def _chunkwise_single_pairwise(
     gamma = jnp.exp(G)  # [N, C, dk]
 
     # Eq. 20/33:  Ē = γ ⊙ (B ⊙ K)                                [N, C, dk]
-    Ebar = gamma * (b * k)
+    Ebar = gamma * e
 
     # Eq. 24/43:  Q_γ, row r = γ_r ⊙ q_r                          [N, C, dk]
     Qg = gamma * q
@@ -827,13 +856,12 @@ def _chunkwise_single_pairwise(
     # Eq. 8, 20/33:  Z = W ⊙ V — gated write targets.             [N, C, dv]
     Z = w * v
 
-    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē (erase side) and
-    # U = (I + T)^{-1} Z (write side) — the closed form of the causal chain
-    # of corrections ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38).
-    # Same triangular system, two right-hand sides (Eqs. 45/46): one batched
-    # forward substitution over the stacked RHS [Ē | Z], no explicit inverse
-    # materialized. Both are S0-independent, hence precomputable for all
-    # chunks in parallel.
+    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē,  U = (I + T)^{-1} Z — the WY
+    # auxiliaries, one forward substitution over the stacked RHS [Ē | Z].
+    # The row recurrences Eqs. 45/46 share the coefficients T, so one solve
+    # yields both; see _chunkwise_single_stacked_RHS_solve for the full
+    # derivation. Y and U are independent of S0 — that is what lets all
+    # chunks precompute them in parallel before the sequential scan.
     YU = jax.scipy.linalg.solve_triangular(
         eye + T, jnp.concatenate([Ebar, Z], axis=-1),
         lower=True, unit_diagonal=True,
@@ -919,12 +947,13 @@ def _chunkwise_single_subchunking(
     dv = v.shape[-1]
     C = chunk_size
     c = sub_chunk_size
-    if L % C:
+    if C <= 0 or L % C:
         raise ValueError(
-            f"sequence length L={L} must be divisible by chunk_size={C}")
-    if C % c:
+            f"chunk_size={C} must be a positive divisor of the sequence "
+            f"length L={L}")
+    if c <= 0 or C % c:
         raise ValueError(
-            f"chunk_size={C} must be divisible by sub_chunk_size={c}")
+            f"sub_chunk_size={c} must be a positive divisor of chunk_size={C}")
     N = L // C   # number of chunks
     M = C // c   # sub-blocks per chunk
 
@@ -1118,22 +1147,10 @@ def chunkwise_gated_delta_rule_2(
         raise ValueError(
             f"core={core!r} is not one of {sorted(_CHUNKWISE_CORES)}")
 
-    def fun(
-        Q: jax.Array,
-        K: jax.Array,
-        V: jax.Array,
-        G: jax.Array,
-        B: jax.Array,
-        W: jax.Array,
-        So: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
-        if core == "subchunking":
-            return _chunkwise_single_subchunking(
-                Q, K, V, G, B, W, So,
-                chunk_size=chunk_size, sub_chunk_size=sub_chunk_size)
-        return _CHUNKWISE_CORES[core](
-            Q, K, V, G, B, W, So, chunk_size=chunk_size)
-
+    kwargs = {"chunk_size": chunk_size}
+    if core == "subchunking":
+        kwargs["sub_chunk_size"] = sub_chunk_size
+    fun = partial(_CHUNKWISE_CORES[core], **kwargs)
     return _batchify(fun)(q, k, v, g, b, w, S0)
 
 
