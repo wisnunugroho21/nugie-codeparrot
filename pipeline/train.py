@@ -338,10 +338,13 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
             print(f"  [ckpt] saved step {step}", flush=True)
             t0 = time.time()  # don't count save time against tok/s
 
-    # final checkpoint
-    ckpt.save(tc.max_steps - 1, model=model, optimizer=optimizer, rngs=rngs,
-              train_iterator=train_iter)
-    ckpt.wait_until_finished()
+    # Final checkpoint — unless the loop's last in-loop save already covered this
+    # step (max_steps a multiple of save_every), where re-saving the same step
+    # would raise StepAlreadyExistsError in Orbax.
+    if ckpt.latest_step() != tc.max_steps - 1:
+        ckpt.save(tc.max_steps - 1, model=model, optimizer=optimizer, rngs=rngs,
+                  train_iterator=train_iter)
+        ckpt.wait_until_finished()
     print(f"Training complete. Final checkpoint at step {tc.max_steps - 1}.")
     ckpt.close()
 

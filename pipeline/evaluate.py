@@ -105,8 +105,21 @@ def run_generate(cfg: ExperimentConfig, step: int | None, prompt: str,
     ids = tokenizer.encode(prompt) or [tokenizer.eos_id]
     prompt_ids = jnp.asarray(ids, jnp.int32)[None, :]  # [1, P]
 
-    # Cache spans the whole prompt+continuation; must respect the MLA context cap.
-    max_len = min(len(ids) + max_new_tokens, cfg.model.max_seq_len)
+    # The MLA latent cache spans the whole prompt+continuation. Truncate the request
+    # to the model's declared context cap rather than clamping max_len below the
+    # request — an undersized cache would make dynamic_update_slice silently
+    # overwrite the last slot instead of erroring.
+    budget = cfg.model.max_seq_len - len(ids)
+    if budget <= 0:
+        raise ValueError(
+            f"Prompt ({len(ids)} tokens) already fills model.max_seq_len "
+            f"({cfg.model.max_seq_len}); nothing can be generated.")
+    if max_new_tokens > budget:
+        print(f"WARNING: prompt ({len(ids)}) + max_new_tokens ({max_new_tokens}) "
+              f"exceeds model.max_seq_len ({cfg.model.max_seq_len}); "
+              f"truncating to {budget} new tokens.")
+        max_new_tokens = budget
+    max_len = len(ids) + max_new_tokens
     gen = model.generate(prompt_ids, max_new_tokens=max_new_tokens, max_len=max_len)
     continuation = tokenizer.decode(gen[0].tolist())
 

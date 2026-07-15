@@ -347,6 +347,12 @@ class KimiLinear(nnx.Module):
         # compiled trace across generate() calls with different prompt lengths
         # (e.g. a chat loop) instead of recompiling for every P + max_new_tokens.
         max_len = max_len or max(self.cfg.max_seq_len, P + max_new_tokens)
+        if P + max_new_tokens > max_len:
+            # An undersized MLA cache would not error: dynamic_update_slice CLAMPS
+            # out-of-bounds start indices, silently overwriting the last slot.
+            raise ValueError(
+                f"prompt ({P}) + max_new_tokens ({max_new_tokens}) exceeds "
+                f"max_len ({max_len}); the MLA latent cache would overflow.")
 
         caches = self.init_cache(B, max_len)
         logits, caches = self.step(prompt_ids, caches)  # prefill the prompt

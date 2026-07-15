@@ -238,10 +238,12 @@ class GroupedQueryLatentAttention(nnx.Module):
         ).swapaxes(1, 2)  # (B, Hkv, max_len, Dh)
         l_kv_rep = l_kv_heads.repeat(self.group_size, axis=1)  # (B, Hq, max_len, Dh)
 
-        # Scores: the L new queries attend over all max_len cached slots.
-        logits = jnp.einsum("bhqd, bhkd -> bhqk", q_heads, l_kv_rep) / jnp.sqrt(
-            self.head_dim
-        )
+        # Scores: the L new queries attend over all max_len cached slots. Upcast to
+        # fp32 for the masking/softmax, mirroring __call__ — otherwise the decode-time
+        # attention distribution would run in bf16 while training's runs in fp32.
+        logits = jnp.einsum("bhqd, bhkd -> bhqk", q_heads, l_kv_rep).astype(
+            F32
+        ) / jnp.sqrt(self.head_dim)
 
         # Causal mask offset by the cache position: query i sits at absolute position
         # pos+i and may attend to slot j iff j <= pos+i.  This also masks the not-yet-
@@ -251,8 +253,9 @@ class GroupedQueryLatentAttention(nnx.Module):
         mask = k_pos[None, :] <= q_pos[:, None]  # (L, max_len)
         logits = jnp.where(mask[None, None], logits, -jnp.inf)
 
-        # Softmax over the key axis -> per-query attention distribution.
-        a = jax.nn.softmax(logits, axis=-1)
+        # Softmax over the key axis (fp32) -> back to the compute dtype for the
+        # weighted-sum matmul, exactly as in __call__.
+        a = jax.nn.softmax(logits, axis=-1).astype(l_kv_rep.dtype)
 
         # Weighted sum of value-latents: the same latent serves as both K and V.
         weighted = jnp.einsum("bhqk, bhkd -> bhqd", a, l_kv_rep)  # (B, Hq, L, Dh)
