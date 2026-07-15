@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 import flax.nnx as nnx
+import jax
 import jax.numpy as jnp
 
 from kimi_linear_gdn2 import KimiLinear, KimiLinearConfig, count_params
@@ -57,6 +58,28 @@ def test_generate_shape_and_determinism(model):
     assert out1.shape == (1, 8)
     np.testing.assert_array_equal(np.asarray(out1), np.asarray(out2))
     assert bool(jnp.all((out1 >= 0) & (out1 < CFG.vocab_size)))
+
+
+def test_generate_sampling_reproducible_and_valid(model):
+    prompt = rand_ids(4, B=1, L=16)
+    key = jax.random.PRNGKey(42)
+    out1 = model.generate(prompt, max_new_tokens=8,
+                          temperature=0.8, top_p=0.9, key=key)
+    out2 = model.generate(prompt, max_new_tokens=8,
+                          temperature=0.8, top_p=0.9, key=key)
+    assert out1.shape == (1, 8)
+    np.testing.assert_array_equal(np.asarray(out1), np.asarray(out2))
+    assert bool(jnp.all((out1 >= 0) & (out1 < CFG.vocab_size)))
+
+
+def test_generate_eos_early_stop(model):
+    """With eos_id set to whatever greedy decoding emits first, the loop must
+    stop after that single token."""
+    prompt = rand_ids(5, B=1, L=16)
+    first = int(model.generate(prompt, max_new_tokens=4)[0, 0])
+    out = model.generate(prompt, max_new_tokens=8, eos_id=first)
+    assert out.shape == (1, 1)
+    assert int(out[0, 0]) == first
 
 
 def test_generate_rejects_undersized_cache(model):

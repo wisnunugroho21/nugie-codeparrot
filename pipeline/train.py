@@ -35,6 +35,7 @@ Run:  python -m pipeline.train --config configs/tiny.yaml [--resume]
 from __future__ import annotations
 
 import argparse
+import math
 import time
 
 import flax.nnx as nnx
@@ -227,7 +228,7 @@ def evaluate_loss(model: KimiLinear, eval_step, val_iter, steps: int,
         tot_tok += float(n)
     model.train()
     mean_ce = tot_ce / max(tot_tok, 1.0)
-    return {"val_loss": mean_ce, "val_ppl": float(jnp.exp(jnp.array(mean_ce)))}
+    return {"val_loss": mean_ce, "val_ppl": math.exp(mean_ce)}
 
 
 def _to_jax(batch: dict) -> dict[str, jax.Array]:
@@ -251,9 +252,15 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
         cfg.data.data_dir, "train", cfg.data.seq_len, tc.batch_size,
         shuffle=True, repeat=True, seed=cfg.data.shuffle_buffer_seed,
         num_workers=cfg.data.num_workers)
-    val_iter = data_mod.make_loader(
-        cfg.data.data_dir, "val", cfg.data.seq_len, tc.batch_size,
-        shuffle=False, repeat=True, seed=0, num_workers=0)
+
+    def make_val_iter():
+        # Rebuilt for EVERY in-training eval so each one measures the same
+        # leading eval_steps batches of the val split. A single shared
+        # repeating iterator would give every eval a different window,
+        # adding data noise to the val-loss curve that isn't model noise.
+        return data_mod.make_loader(
+            cfg.data.data_dir, "val", cfg.data.seq_len, tc.batch_size,
+            shuffle=False, repeat=True, seed=0, num_workers=0)
 
     # --- model + optimizer ---
     # Keep the Rngs object around (not just the seed): it is checkpointed alongside
@@ -301,26 +308,30 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
         print(f"Resumed from step {restored_step}")
 
     # --- loop ---
+    schedule = build_schedule(tc)
     t0 = time.time()
     tokens_per_step = tc.batch_size * cfg.data.seq_len
-    running_ce = 0.0
+    running_ce = None  # device-side accumulator, host-synced only at log_every
     for step in range(start_step, tc.max_steps):
         batch = shard_batch(_to_jax(next(train_iter)))
         total, ce, aux_loss = train_step(model, optimizer, batch, tc.router_bias_lr)
-        running_ce += float(ce)
+        # Keep ce on device: calling float(ce) every step would block the host
+        # on that step's result and defeat JAX's async dispatch (the device
+        # could no longer run ahead while the host prepares the next batch).
+        running_ce = ce if running_ce is None else running_ce + ce
 
         if (step + 1) % tc.log_every == 0:
+            mean_ce = float(running_ce) / tc.log_every  # the one host sync
             dt = time.time() - t0
             tok_s = tokens_per_step * tc.log_every / dt
-            mean_ce = running_ce / tc.log_every
-            lr = float(build_schedule(tc)(step))
+            lr = float(schedule(step))
             print(f"step {step + 1:>7}/{tc.max_steps} | loss {mean_ce:6.4f} | "
-                  f"ppl {jnp.exp(jnp.array(mean_ce)):8.2f} | aux {float(aux_loss):.4f} "
+                  f"ppl {math.exp(mean_ce):8.2f} | aux {float(aux_loss):.4f} "
                   f"| lr {lr:.2e} | {tok_s:,.0f} tok/s", flush=True)
-            running_ce, t0 = 0.0, time.time()
+            running_ce, t0 = None, time.time()
 
         if (step + 1) % tc.eval_every == 0:
-            m = evaluate_loss(model, eval_step, val_iter, tc.eval_steps,
+            m = evaluate_loss(model, eval_step, make_val_iter(), tc.eval_steps,
                               shard=shard_batch)
             print(f"  [eval] step {step + 1} | val_loss {m['val_loss']:.4f} | "
                   f"val_ppl {m['val_ppl']:.2f}", flush=True)

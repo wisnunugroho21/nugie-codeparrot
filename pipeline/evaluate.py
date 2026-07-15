@@ -94,7 +94,8 @@ def run_eval(cfg: ExperimentConfig, step: int | None, max_batches: int | None) -
 
 # --------------------------------------------------------------------------- #
 def run_generate(cfg: ExperimentConfig, step: int | None, prompt: str,
-                 max_new_tokens: int) -> None:
+                 max_new_tokens: int, temperature: float = 0.0,
+                 top_p: float = 1.0, seed: int = 0) -> None:
     model, restored = load_trained(cfg, step)
     meta = data_mod.load_meta(cfg.data.data_dir)
     tokenizer = build_tokenizer(
@@ -120,7 +121,12 @@ def run_generate(cfg: ExperimentConfig, step: int | None, prompt: str,
               f"truncating to {budget} new tokens.")
         max_new_tokens = budget
     max_len = len(ids) + max_new_tokens
-    gen = model.generate(prompt_ids, max_new_tokens=max_new_tokens, max_len=max_len)
+    # Stop at the training EOS (the packed-stream document separator): once the
+    # model closes the "document", further tokens would start an unrelated one.
+    gen = model.generate(
+        prompt_ids, max_new_tokens=max_new_tokens, max_len=max_len,
+        temperature=temperature, top_p=top_p,
+        eos_id=int(meta["eos_id"]), key=jax.random.PRNGKey(seed))
     continuation = tokenizer.decode(gen[0].tolist())
 
     print("=== Prompt ===")
@@ -142,6 +148,14 @@ def main() -> None:
     ap.add_argument("--prompt", default="def hello_world():\n",
                     help="Prompt text for --generate.")
     ap.add_argument("--max-new-tokens", type=int, default=128)
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="0 = greedy decode; > 0 samples from "
+                         "softmax(logits / temperature).")
+    ap.add_argument("--top-p", type=float, default=1.0,
+                    help="Nucleus sampling cutoff in (0, 1]; only used when "
+                         "--temperature > 0. 1.0 disables the truncation.")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="Sampling seed for --temperature > 0.")
     args = ap.parse_args()
 
     cfg = ExperimentConfig.load(args.config)
@@ -150,7 +164,9 @@ def main() -> None:
     if args.eval:
         run_eval(cfg, args.step, args.max_batches)
     if args.generate:
-        run_generate(cfg, args.step, args.prompt, args.max_new_tokens)
+        run_generate(cfg, args.step, args.prompt, args.max_new_tokens,
+                     temperature=args.temperature, top_p=args.top_p,
+                     seed=args.seed)
 
 
 if __name__ == "__main__":

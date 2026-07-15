@@ -80,9 +80,10 @@ class GDN2Cache(NamedTuple):
 
 
 class RMSNorm(nnx.Module):
-    """Plain RMSNorm used for the pre-norms around mixer / channel-mixer."""
+    """Plain RMSNorm used for the pre-norms around mixer / channel-mixer.
+    Takes no rngs: its only parameter is the deterministic all-ones gain."""
 
-    def __init__(self, dim: int, *, eps: float = 1e-5, rngs: nnx.Rngs):
+    def __init__(self, dim: int, *, eps: float = 1e-5):
         self.eps = eps
         self.weight = nnx.Param(jnp.ones((dim,)))
 
@@ -121,7 +122,7 @@ class GatedRMSNorm(nnx.Module):
         eps: float = 1e-5,
         rngs: nnx.Rngs,
     ):
-        self.norm = RMSNorm(head_dim, eps=eps, rngs=rngs)
+        self.norm = RMSNorm(head_dim, eps=eps)
         # Deliberately NO compute_dtype here (unlike the q/k/v/b/w/o projections):
         # the gate multiplies the fp32-normalized output, so it is kept in fp32.
         self.gate = nnx.Linear(

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nugie-codeparrot"
+version = "0.1.0"
+description = "Kimi Linear (GDN-2) code LM and CodeParrot training pipeline in JAX / Flax NNX"
+requires-python = ">=3.10"
+dependencies = [
+    "jax>=0.6",
+    "flax>=0.10",
+    "optax>=0.2.4",           # Muon needs optax.contrib.muon w/ MuonDimensionNumbers + consistent_rms
+    "orbax-checkpoint>=0.6",
+    "grain>=0.2",
+    "datasets>=2.19",         # streams codeparrot/codeparrot-train-v2-near-dedup from the HF Hub
+    "transformers>=4.40",     # the pretrained codeparrot BPE tokenizer
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+py-modules = ["kimi_linear_gdn2"]
+packages = ["gated_deltanet_2", "multi_latent_attention", "pipeline"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

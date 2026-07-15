@@ -145,7 +145,7 @@ class DecoderLayer(nnx.Module):
         self.is_full_attn = (layer_idx + 1) % cfg.full_attn_period == 0
 
         # Pre-norm before the token mixer (Fig. 2). RMSNorm reused from the GDN-2 layer.
-        self.norm1 = RMSNorm(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
+        self.norm1 = RMSNorm(cfg.d_model, eps=cfg.rms_eps)
 
         if self.is_full_attn:
             # Full attention: NoPE Multi-head Latent Attention (absorbed/GQA form).
@@ -174,7 +174,7 @@ class DecoderLayer(nnx.Module):
             )
 
         # Pre-norm before the channel mixer.
-        self.norm2 = RMSNorm(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
+        self.norm2 = RMSNorm(cfg.d_model, eps=cfg.rms_eps)
 
         # Channel mixer: MoE
         self.channel_mixer = GroupedGemmMoE(
@@ -261,7 +261,7 @@ class KimiLinear(nnx.Module):
 
         # Final pre-head norm + untied LM head (Moonlight/DeepSeek do not tie weights;
         # to tie, drop lm_head and use `x @ self.embed.embedding.value.T` instead).
-        self.norm_f = RMSNorm(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
+        self.norm_f = RMSNorm(cfg.d_model, eps=cfg.rms_eps)
         self.lm_head = nnx.Linear(
             cfg.d_model,
             cfg.vocab_size,
@@ -327,24 +327,42 @@ class KimiLinear(nnx.Module):
         return self.lm_head(x).astype(jnp.float32), new_caches
 
     def generate(
-        self, prompt_ids: jax.Array, max_new_tokens: int, max_len: int | None = None
+        self,
+        prompt_ids: jax.Array,
+        max_new_tokens: int,
+        max_len: int | None = None,
+        *,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        eos_id: int | None = None,
+        key: jax.Array | None = None,
     ) -> jax.Array:
-        """Greedy autoregressive decode that REUSES each layer's state across steps.
-        prompt_ids: int[B, P]. Returns the continuation int[B, max_new_tokens].
+        """Autoregressive decode that REUSES each layer's state across steps.
+        prompt_ids: int[B, P]. Returns the continuation int[B, T] with
+        T <= max_new_tokens (shorter only when `eos_id` ends every row early).
 
-        Prefill consumes the whole prompt in one step (filling every layer's cache) —
-        the GDN-2 layers push all whole chunks of the prompt through their PARALLEL
-        chunkwise core and only the ragged tail through the recurrence, so prefill
-        cost scales with P/chunk_size sequential steps, not P. Each decode step then
-        feeds back ONE token and carries the caches forward — the GDN-2 layers via
-        their fixed-size recurrent state, the MLA layers via the growing latent
-        cache. The decode loop runs through `_decode_step`, a module-level nnx.jit
-        function: it compiles once per (batch size, cache length) and every further
-        token — across generate() calls too — reuses the trace."""
+        SELECTION. Greedy by default (temperature == 0). temperature > 0
+        samples from softmax(logits / temperature), truncated to the nucleus:
+        the smallest set of tokens whose probability mass reaches `top_p`
+        (top_p=1.0 disables the truncation). `key` seeds the sampler (defaults
+        to PRNGKey(0) — pass your own for varied samples). With `eos_id` set,
+        rows that emitted it keep emitting eos_id (padding), and the loop stops
+        early once every row is done (costs one small host sync per token).
+
+        Prefill consumes the whole prompt in one JITTED step (filling every
+        layer's cache) — the GDN-2 layers push all whole chunks of the prompt
+        through their PARALLEL chunkwise core and only the ragged tail through
+        the recurrence, so prefill cost scales with P/chunk_size sequential
+        steps, not P. It compiles once per (batch size, P, cache length). Each
+        decode step then feeds back ONE token and carries the caches forward —
+        the GDN-2 layers via their fixed-size recurrent state, the MLA layers
+        via the growing latent cache — through the same module-level nnx.jit
+        step, which compiles once per (batch size, cache length) and every
+        further token — across generate() calls too — reuses the trace."""
         B, P = prompt_ids.shape
         # Default the cache length to the config's declared context cap when the
-        # request fits inside it: a FIXED cache shape lets _decode_step reuse its
-        # compiled trace across generate() calls with different prompt lengths
+        # request fits inside it: a FIXED cache shape lets the decode step reuse
+        # its compiled trace across generate() calls with different prompt lengths
         # (e.g. a chat loop) instead of recompiling for every P + max_new_tokens.
         max_len = max_len or max(self.cfg.max_seq_len, P + max_new_tokens)
         if P + max_new_tokens > max_len:
@@ -354,35 +372,77 @@ class KimiLinear(nnx.Module):
                 f"prompt ({P}) + max_new_tokens ({max_new_tokens}) exceeds "
                 f"max_len ({max_len}); the MLA latent cache would overflow.")
 
+        greedy = temperature <= 0.0
+        if not greedy and key is None:
+            key = jax.random.PRNGKey(0)
+
+        def advance(tok, caches):
+            nonlocal key
+            if greedy:
+                return _decode_step(self, tok, caches)
+            key, sub = jax.random.split(key)
+            return _sample_step(self, tok, caches, sub, temperature, top_p)
+
         caches = self.init_cache(B, max_len)
-        logits, caches = self.step(prompt_ids, caches)  # prefill the prompt
-        next_tok = jnp.argmax(logits[:, -1:], axis=-1)  # [B, 1] greedy
+        next_tok, caches = advance(prompt_ids, caches)  # jitted prefill
         outs = [next_tok]
+        done = (next_tok == eos_id) if eos_id is not None else None
 
         for _ in range(max_new_tokens - 1):
-            next_tok, caches = _decode_step(self, next_tok, caches)
+            if done is not None and bool(jnp.all(done)):
+                break  # every row has emitted eos_id
+            next_tok, caches = advance(next_tok, caches)
+            if done is not None:
+                next_tok = jnp.where(done, eos_id, next_tok)  # pad finished rows
+                done = done | (next_tok == eos_id)
             outs.append(next_tok)
 
-        return jnp.concatenate(outs, axis=1)  # [B, max_new_tokens]
+        return jnp.concatenate(outs, axis=1)  # [B, T<=max_new_tokens]
 
 
 # --------------------------------------------------------------------------- #
-#  Jitted greedy decode step, shared by every generate() call.
+#  Jitted decode steps, shared by every generate() call (prefill included).
 #
 #  During decoding everything is shape-constant — the weights, the fixed-size
 #  GDN-2 states, the preallocated MLA latent buffers (position is a TRACED int32,
-#  so advancing it never retraces), and L=1 — so this compiles ONCE per (batch
-#  size, cache length) and each further token replays the compiled trace.
-#  Module-level on purpose: nnx.jit keys its compilation cache on the function
-#  object, so a wrapper created inside generate() would recompile every call.
+#  so advancing it never retraces), and L=1 — so these compile ONCE per (batch
+#  size, input length, cache length) and each further token replays the compiled
+#  trace. Module-level on purpose: nnx.jit keys its compilation cache on the
+#  function object, so a wrapper created inside generate() would recompile every
+#  call.
 # --------------------------------------------------------------------------- #
 @nnx.jit
 def _decode_step(
     model: KimiLinear, tok: jax.Array, caches: list
 ) -> tuple[jax.Array, list]:
-    """One greedy decode step: tok int[B, 1] -> (next greedy token int[B, 1], caches)."""
+    """One greedy step: tok int[B, L] -> (next greedy token int[B, 1], caches).
+    L is the prompt length on prefill, 1 on every decode step."""
     logits, caches = model.step(tok, caches)
     return jnp.argmax(logits[:, -1:], axis=-1), caches
+
+
+@nnx.jit
+def _sample_step(
+    model: KimiLinear, tok: jax.Array, caches: list,
+    key: jax.Array, temperature: jax.Array, top_p: jax.Array,
+) -> tuple[jax.Array, list]:
+    """One sampling step: softmax(logits / temperature) truncated to the top-p
+    nucleus. temperature/top_p are traced scalars, so changing them between
+    generate() calls reuses the compiled trace."""
+    logits, caches = model.step(tok, caches)
+    logits = logits[:, -1] / temperature  # [B, vocab], already fp32
+
+    # Nucleus (top-p) filter: sort descending, find the logit where the
+    # cumulative probability first reaches top_p, and mask everything below it.
+    # top_p = 1.0 keeps every token (the cutoff lands on the smallest logit).
+    sorted_logits = jnp.sort(logits, axis=-1)[:, ::-1]
+    cum = jnp.cumsum(jax.nn.softmax(sorted_logits, axis=-1), axis=-1)
+    cut_idx = jnp.minimum(
+        jnp.sum(cum < top_p, axis=-1, keepdims=True), logits.shape[-1] - 1)
+    cutoff = jnp.take_along_axis(sorted_logits, cut_idx, axis=-1)  # [B, 1]
+    logits = jnp.where(logits < cutoff, -jnp.inf, logits)
+
+    return jax.random.categorical(key, logits, axis=-1)[:, None], caches
 
 
 def count_params(model: nnx.Module) -> int:

@@ -99,10 +99,10 @@ Two independent optimizations distinguish the chunkwise cores.
     (I + T) X = RHS with right-hand sides Ē and Z (Eqs. 45/46). The
     faithful core materializes the explicit inverse A = (I + T)^{-1} and
     multiplies twice, as the paper writes it; every other chunkwise core
-    uses ONE forward substitution over the stacked RHS [Ē | Z] — fewer
-    flops (a (dk+dv)-RHS solve replaces a C-RHS solve plus two matmuls),
-    one less [C, C] intermediate, and better numerics than multiplying by
-    an explicitly formed inverse.
+    uses ONE forward substitution over the stacked RHS [Ē | Z] (_wy_solve)
+    — fewer flops (a (dk+dv)-RHS solve replaces a C-RHS solve plus two
+    matmuls), one less [C, C] intermediate, and better numerics than
+    multiplying by an explicitly formed inverse.
 
 (b) DECAY FACTORIZATION. Define the pairwise decay ratios
 
@@ -161,7 +161,7 @@ backward is only needed for a fused Triton/Pallas kernel.
 Shape conventions (one head): q, k, g, b: [L, dk]; v, w: [L, dv];
 S0: [dk, dv]. Public entry points add leading [B, H] axes via vmap.
 All math runs in fp32 (paper App. D). Every core is verified against
-_recurrent_single and an independent float64 oracle in test_rule.py.
+_recurrent_single and an independent float64 oracle in tests/test_rule.py.
 """
 
 from functools import partial
@@ -246,6 +246,144 @@ def _recurrent_single(
     return o.squeeze(-1), S_final
 
 
+# --------------------------------------------------------------------------- #
+#  Shared chunkwise machinery.
+#
+#  Every chunkwise core is the same three-stage pipeline and differs ONLY in
+#  how it factorizes the decay ratios entering the score matrices T and A_qk
+#  (strategy notes in the module docstring):
+#
+#    1. preamble          _chunk_inputs      validate C, reshape [L,d]->[N,C,d]
+#    2. chunk-local       per-core           decay factorization -> T, Aqk,
+#       precompute                           Ebar, Z, Qg, Ktail, gamma_C
+#       + WY solve        _wy_solve          Y, U from ONE stacked-RHS solve
+#    3. cross-chunk scan  _cross_chunk_scan  the ONLY sequential part
+# --------------------------------------------------------------------------- #
+def _chunk_inputs(q, k, v, g, b, w, S0, chunk_size):
+    """Shared preamble: validate the chunking and reshape every [L, d] input
+    to [N, C, d] in D_TYPE — one leading axis per chunk, so every chunk-local
+    quantity is computed for all N chunks at once. The within-chunk cumsum
+    restarting at each boundary is what realizes both γ_0 = 1 (Eq. 18/30) and
+    the normalized init Ŝ_0 = S_[n] (Eq. 31).
+
+    Returns ((q, k, v, g, b, w) chunked, S0 in D_TYPE)."""
+    L = k.shape[0]
+    C = chunk_size
+    if C <= 0 or L % C:
+        raise ValueError(
+            f"chunk_size={C} must be a positive divisor of the sequence "
+            f"length L={L}")
+    N = L // C
+
+    def to_chunks(x):
+        return x.reshape(N, C, x.shape[-1]).astype(D_TYPE)
+
+    return tuple(to_chunks(x) for x in (q, k, v, g, b, w)), S0.astype(D_TYPE)
+
+
+def _wy_solve(T: jax.Array, Ebar: jax.Array, Z: jax.Array):
+    """WY auxiliaries  Y = (I + T)^{-1} Ē  and  U = (I + T)^{-1} Z  from ONE
+    forward substitution over the stacked right-hand side [Ē | Z]
+    (Eqs. 21/34 + 22/34). Used by every chunkwise core except the faithful
+    one (which keeps the paper's explicit inverse verbatim).
+
+    HOW Eq. 21/34 and Eq. 22/34 WORK. The chunk's residuals obey
+    ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38): before edit r can be
+    applied, it must subtract its overlap T_rs with every EARLIER edit s it
+    partially erases. Stacking the C rows turns that chain of corrections
+    into one linear system, (I + T) R = Z − Ē S0 (Eq. 39). T is strictly
+    lower triangular (causality), so I + T is unit lower-triangular and
+    invertible by construction — Eq. 21/34 defines A = (I + T)^{-1}, and
+    Eq. 22/34 pushes A onto the two S0-independent right-hand sides:
+    Y = A Ē (erase side), U = A Z (write side), so that later
+    R = U − Y S0 assembles the residuals for ANY chunk-entry state.
+
+    HOW THE ROW RECURRENCES OF App. A.4 WORK. Expanding (I + T) Y = Ē and
+    (I + T) U = Z row by row gives
+        y_rᵀ = ē_rᵀ − Σ_{s<r} (ē_rᵀ k̄_s) y_sᵀ,      Eq. 45
+        u_rᵀ = z_rᵀ − Σ_{s<r} (ē_rᵀ k̄_s) u_sᵀ,      Eq. 46
+    i.e. row r starts from its own factor (ē_r or z_r) and subtracts each
+    earlier, ALREADY-CORRECTED row s weighted by the overlap T_rs = ē_rᵀ k̄_s.
+    Computing row 1, then row 2 from row 1, then row 3 from rows 1-2, ... is
+    exactly forward substitution — solve_triangular below runs that C-step
+    chain in one call. Both recurrences share the SAME coefficients T and
+    differ only in the starting vectors, which is why one solve over the
+    stacked RHS [Ē | Z] yields both auxiliaries at once (App. A.4: "the same
+    WY inverse can be shared by the erase-side and write-side computations").
+
+    The explicit inverse A is never materialized: that would cost a C-RHS
+    solve plus two matmuls and is numerically worse than solving directly.
+    Y and U are independent of S0 — that is what lets all chunks precompute
+    them in parallel before the sequential scan.
+
+    T: [N, C, C]; Ebar: [N, C, dk]; Z: [N, C, dv] -> (Y [N,C,dk], U [N,C,dv]).
+    """
+    dk = Ebar.shape[-1]
+    eye = jnp.eye(T.shape[-1], dtype=T.dtype)
+    YU = jax.scipy.linalg.solve_triangular(
+        eye + T, jnp.concatenate([Ebar, Z], axis=-1),
+        lower=True, unit_diagonal=True,
+    )
+    return YU[..., :dk], YU[..., dk:]
+
+
+def _cross_chunk_scan(S0, Y, U, Aqk, Qg, Ktail, gamma_C, delta=None):
+    """Cross-chunk recurrence — the ONLY sequential part, identical in every
+    chunkwise core. S is the raw chunk-entry state S_[n] (NOT decay-
+    normalized); each of the N steps is three small matmuls over the
+    per-chunk slices Y_n [C, dk], U_n [C, dv], Aqk_n [C, C], Qg_n [C, dk],
+    Ktail_n [C, dk], gamma_C_n [dk].
+
+    `delta` is the centered core's per-chunk re-attachment factor
+    exp(G_C/2) ≤ 1: when given, S0 is pre-scaled per chunk as diag(delta_n) S
+    so that Y_n S_c == (A Ē) S0 and Qg_n S_c == Q_γ S0 hold exactly. The
+    other cores carry the true absolute γ inside Ē and Q_γ and pass None.
+
+    Returns (O flattened back to [L, dv], S_final [dk, dv])."""
+    xs = (Y, U, Aqk, Qg, Ktail, gamma_C)
+    if delta is not None:
+        xs = xs + (delta,)
+
+    def chunk_step(S, inp):
+        if delta is None:
+            Y_n, U_n, Aqk_n, Qg_n, Ktail_n, gamma_C_n = inp
+            S_c = S
+        else:
+            Y_n, U_n, Aqk_n, Qg_n, Ktail_n, gamma_C_n, delta_n = inp
+            S_c = delta_n[:, None] * S  # diag(exp(c)) S0 — re-attach the shift
+
+        # Eq. 35:  R = U − Y S0.                                    [C, dv]
+        # Row r is the residual ρ_r = z_r − ē_rᵀ Ŝ_{r−1} (Eq. 37): what is
+        # left to write at step r after subtracting what the decayed,
+        # already-edited memory returns along the erase direction. U covers
+        # the intra-chunk part; −Y S0 corrects for inherited content. R is
+        # exactly the chunk's set of rank-one updates:
+        # Ŝ_r = S0 + Σ_{s≤r} k̄_s ρ_sᵀ (Eq. 36).
+        R = U_n - Y_n @ S_c
+
+        # Eq. 24/44:  O = Q_γ S0 + A_qk R.                          [C, dv]
+        # Two read paths: history (query reads the chunk-entry state through
+        # its decay γ_r) + intra-chunk (causal scores against this chunk's
+        # residual writes). This is o_r = S_rᵀ q_r unrolled through Eq. 36.
+        o = Qg_n @ S_c + Aqk_n @ R
+
+        # Eq. 23/40:  S_[n+1] = Diag(γ_C) S0 + K_tailᵀ R.          [dk, dv]
+        # Hand-off to the next chunk: old state after a full chunk of decay
+        # (erasures folded into R), plus every residual write re-keyed by
+        # its tail-decayed key. gamma_C broadcasts over key-channel rows.
+        S_new = gamma_C_n[:, None] * S + Ktail_n.T @ R
+
+        return S_new, o
+
+    # scan carries S across chunks; stacked outputs o: [N, C, dv].
+    S_final, o = lax.scan(chunk_step, S0, xs)
+    return o.reshape(-1, o.shape[-1]), S_final
+
+
+# --------------------------------------------------------------------------- #
+#  The chunkwise cores. Each keeps only its own decay factorization; the
+#  preamble, WY solve, and cross-chunk scan live in the helpers above.
+# --------------------------------------------------------------------------- #
 def _chunkwise_single_faithful(
     q: jax.Array,
     k: jax.Array,
@@ -274,29 +412,10 @@ def _chunkwise_single_faithful(
     Returns:
       (O: [L, dv], S_final: [dk, dv])
     """
-    L, dk = k.shape
-    dv = v.shape[-1]
-    C = chunk_size
-    if C <= 0 or L % C:
-        raise ValueError(
-            f"chunk_size={C} must be a positive divisor of the sequence "
-            f"length L={L}")
-    N = L // C  # number of chunks
-
-    def to_chunks(x):
-        # [L, d] -> [N, C, d]: one leading axis per chunk, so every
-        # chunk-local quantity below is computed for all N chunks at once.
-        return x.reshape(N, C, x.shape[-1]).astype(D_TYPE)
-
-    q, k, v = to_chunks(q), to_chunks(k), to_chunks(v)   # [N, C, dk/dk/dv]
-    g, b, w = to_chunks(g), to_chunks(b), to_chunks(w)   # [N, C, dk/dk/dv]
-
-    eye = jnp.eye(C, dtype=D_TYPE)  # [C, C]
-    S0 = S0.astype(D_TYPE)          # [dk, dv]
+    (q, k, v, g, b, w), S0 = _chunk_inputs(q, k, v, g, b, w, S0, chunk_size)
+    eye = jnp.eye(chunk_size, dtype=D_TYPE)  # [C, C]
 
     # ---- Chunk-local precompute (parallel over the N chunks) -------------
-    # The cumsum restarts at each chunk boundary, which realizes both
-    # γ_0 = 1 (Eq. 18/30) and the normalized init Ŝ_0 = S_[n] (Eq. 31).
 
     # Eq. 18/30:  G_r = Σ_{i≤r} g_i (inclusive, within chunk).   [N, C, dk]
     # g ≤ 0 is the per-token log-decay, so γ_r = exp(G_r) = Π_{i≤r} α_i is
@@ -344,6 +463,8 @@ def _chunkwise_single_faithful(
     # edit first accounts for every earlier edit it partially erases.
     # Stacked: (I + T) R = Z − Ē S0. I + T is unit lower-triangular, so one
     # batched forward substitution replaces the C-step sequential recurrence.
+    # The EXPLICIT inverse is the paper's literal form — every other core
+    # replaces it with _wy_solve's stacked-RHS forward substitution.
     A = jax.scipy.linalg.solve_triangular(
         eye + T, jnp.broadcast_to(eye, T.shape), lower=True, unit_diagonal=True
     )
@@ -373,44 +494,7 @@ def _chunkwise_single_faithful(
     # exp(G_C − G_r) instead.
     Ktail = k * (gamma_C[:, None, :] / gamma)
 
-    # ---- Cross-chunk recurrence: the ONLY sequential part -----------------
-    # S is the raw chunk-entry state S_[n] (NOT decay-normalized); each step
-    # is three small matmuls.
-    def chunk_step(
-        S: jax.Array,
-        inp: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
-    ) -> tuple[jax.Array, jax.Array]:
-        # S: [dk, dv].  Per-chunk slices:
-        # Y_n [C, dk], U_n [C, dv], Aqk_n [C, C], Qg_n [C, dk],
-        # Ktail_n [C, dk], gamma_C_n [dk].
-        Y_n, U_n, Aqk_n, Qg_n, Ktail_n, gamma_C_n = inp
-
-        # Eq. 35:  R = U − Y S0.                                    [C, dv]
-        # Row r is the residual ρ_r = z_r − ē_rᵀ Ŝ_{r−1} (Eq. 37): what is
-        # left to write at step r after subtracting what the decayed,
-        # already-edited memory returns along the erase direction. U covers
-        # the intra-chunk part; −Y S0 corrects for inherited content. R is
-        # exactly the chunk's set of rank-one updates:
-        # Ŝ_r = S0 + Σ_{s≤r} k̄_s ρ_sᵀ (Eq. 36).
-        R = U_n - Y_n @ S
-
-        # Eq. 24/44:  O = Q_γ S0 + A_qk R.                          [C, dv]
-        # Two read paths: history (query reads the chunk-entry state through
-        # its decay γ_r) + intra-chunk (causal scores against this chunk's
-        # residual writes). This is o_r = S_rᵀ q_r unrolled through Eq. 36.
-        o = Qg_n @ S + Aqk_n @ R
-
-        # Eq. 23/40:  S_[n+1] = Diag(γ_C) S0 + K_tailᵀ R.          [dk, dv]
-        # Hand-off to the next chunk: old state after a full chunk of decay
-        # (erasures folded into R), plus every residual write re-keyed by
-        # its tail-decayed key. gamma_C broadcasts over key-channel rows.
-        S_new = gamma_C_n[:, None] * S + Ktail_n.T @ R
-
-        return S_new, o
-
-    # scan carries S across chunks; stacked outputs o: [N, C, dv].
-    S_final, o = lax.scan(chunk_step, S0, (Y, U, Aqk, Qg, Ktail, gamma_C))
-    return o.reshape(L, dv), S_final
+    return _cross_chunk_scan(S0, Y, U, Aqk, Qg, Ktail, gamma_C)
 
 
 def _chunkwise_single_stacked_RHS_solve(
@@ -430,15 +514,8 @@ def _chunkwise_single_stacked_RHS_solve(
     keeps the paper's literal K̄ = exp(−G) ⊙ K and the γ_C/γ ratio for
     K_tail, and therefore shares the same fp32 limits (overflow once the
     within-chunk cumulative log-decay |G_C| > ≈ 88) — but computes the WY
-    auxiliaries with ONE triangular solve over the stacked right-hand side,
-
-        [Y | U] = (I + T)^{-1} [Ē | Z]        (Eqs. 22/34, 45/46)
-
-    instead of materializing the explicit inverse A = (I + T)^{-1} and
-    multiplying twice. That is fewer flops (a (dk+dv)-RHS solve replaces a
-    C-RHS solve plus two [C,C] @ [C,d] matmuls), one less [C, C]
-    intermediate per chunk, and better numerics than multiplying by an
-    explicitly formed inverse.
+    auxiliaries with ONE triangular solve over the stacked right-hand side
+    (see _wy_solve) instead of materializing the explicit inverse.
 
     This core isolates the SOLVER optimization from the NUMERICAL-RANGE
     ones: diffing it against faithful shows exactly the stacked-RHS change,
@@ -446,160 +523,27 @@ def _chunkwise_single_stacked_RHS_solve(
 
     Args / returns: identical to _chunkwise_single_faithful.
     """
-    L, dk = k.shape
-    dv = v.shape[-1]
-    C = chunk_size
-    if C <= 0 or L % C:
-        raise ValueError(
-            f"chunk_size={C} must be a positive divisor of the sequence "
-            f"length L={L}")
-    N = L // C  # number of chunks
+    (q, k, v, g, b, w), S0 = _chunk_inputs(q, k, v, g, b, w, S0, chunk_size)
 
-    def to_chunks(x):
-        # [L, d] -> [N, C, d]: one leading axis per chunk, so every
-        # chunk-local quantity below is computed for all N chunks at once.
-        return x.reshape(N, C, x.shape[-1]).astype(D_TYPE)
+    # Literal paper factors, identical to _chunkwise_single_faithful — see
+    # its comments for the derivation of each quantity.
+    G = jnp.cumsum(g, axis=1)                    # Eq. 18/30       [N, C, dk]
+    gamma = jnp.exp(G)                           # Eq. 18/30       [N, C, dk]
+    gamma_C = gamma[:, -1]                       # total chunk decay  [N, dk]
+    Kbar = k * jnp.exp(-G)                       # Eq. 19/33 (overflow source)
+    Ebar = gamma * (b * k)                       # Eq. 20/33       [N, C, dk]
+    Z = w * v                                    # Eq. 8, 20/33    [N, C, dv]
+    Qg = gamma * q                               # Eq. 24/43       [N, C, dk]
+    T = jnp.tril(Ebar @ Kbar.swapaxes(-1, -2), k=-1)  # Eq. 21/34  [N, C, C]
 
-    q, k, v = to_chunks(q), to_chunks(k), to_chunks(v)   # [N, C, dk/dk/dv]
-    g, b, w = to_chunks(g), to_chunks(b), to_chunks(w)   # [N, C, dk/dk/dv]
+    # Eqs. 21/34 + 22/34 via ONE stacked-RHS forward substitution — the
+    # solver optimization this core exists to isolate (see _wy_solve).
+    Y, U = _wy_solve(T, Ebar, Z)
 
-    eye = jnp.eye(C, dtype=D_TYPE)  # [C, C]
-    S0 = S0.astype(D_TYPE)          # [dk, dv]
+    Aqk = jnp.tril(Qg @ Kbar.swapaxes(-1, -2))   # Eq. 25/43       [N, C, C]
+    Ktail = k * (gamma_C[:, None, :] / gamma)    # Eq. 23/41 (NaN when γ underflows)
 
-    # ---- Chunk-local precompute (parallel over the N chunks) -------------
-    # The cumsum restarts at each chunk boundary, which realizes both
-    # γ_0 = 1 (Eq. 18/30) and the normalized init Ŝ_0 = S_[n] (Eq. 31).
-
-    # Eq. 18/30:  G_r = Σ_{i≤r} g_i (inclusive, within chunk).   [N, C, dk]
-    # g ≤ 0 is the per-token log-decay, so γ_r = exp(G_r) = Π_{i≤r} α_i is
-    # the total shrinkage a key channel accumulated since chunk start. A
-    # write at step s read at step r survives with γ_r/γ_s = exp(G_r − G_s):
-    # summing logs turns the running product of gates into a cumsum.
-    G = jnp.cumsum(g, axis=1)
-
-    # Eq. 18/30:  γ_r = exp(G_r)                                  [N, C, dk]
-    gamma = jnp.exp(G)
-
-    # Total chunk decay γ_C (last row): how much of the chunk-entry state
-    # survives to the end of the chunk (the carry in Eq. 23/40).   [N, dk]
-    gamma_C = gamma[:, -1]
-
-    # --- Decay normalization: S_r = Diag(γ_r) Ŝ_r (Eq. 31) removes Diag(α)
-    # from the recurrence and moves it into the rank-one factors. The ratio
-    # γ_r/γ_s is split: γ^{-1} goes on the write side (K̄), γ on the read
-    # side (Ē).
-    # Eq. 19/32/33:  K̄ = γ^{-1} ⊙ K                              [N, C, dk]
-    Kbar = k * jnp.exp(-G)
-
-    # Eq. 20/33:  Ē = γ ⊙ (B ⊙ K), with e_r = b_r ⊙ k_r (Eq. 8). [N, C, dk]
-    # Row r pairs with a K̄ row s<r as ē_rᵀ k̄_s = e_rᵀ Diag(γ_r/γ_s) k_s:
-    # how much of the association written at s, decayed until r, lies along
-    # the gated erase direction e_r.
-    Ebar = gamma * (b * k)
-
-    # Eq. 8, 20/33:  Z = W ⊙ V — gated write targets.             [N, C, dv]
-    # No γ here: values live on the dv axis, decay acts on key channels.
-    Z = w * v
-
-    # Eq. 24/43:  Q_γ, row r = γ_r ⊙ q_r.                         [N, C, dk]
-    # The query reads the chunk-entry state decayed down to its own step r.
-    Qg = gamma * q
-
-    # --- WY triangular solve (the parallelization) ---
-    # Eq. 21/34:  T = tril(Ē K̄ᵀ, −1), T_rs = ē_rᵀ k̄_s (s < r).   [N, C, C]
-    # T_rs measures how strongly token r's erase overlaps token s's decayed
-    # write. Strictly lower triangular = causality (r only erases the past).
-    T = jnp.tril(Ebar @ Kbar.swapaxes(-1, -2), k=-1)
-
-    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē,  U = (I + T)^{-1} Z.
-    #
-    # HOW Eq. 21/34 and Eq. 22/34 WORK. The chunk's residuals obey
-    # ρ_r = (z_r − ē_rᵀ S0) − Σ_{s<r} T_rs ρ_s (Eq. 38): before edit r can be
-    # applied, it must subtract its overlap T_rs with every EARLIER edit s it
-    # partially erases. Stacking the C rows turns that chain of corrections
-    # into one linear system, (I + T) R = Z − Ē S0 (Eq. 39). T is strictly
-    # lower triangular (causality), so I + T is unit lower-triangular and
-    # invertible by construction — Eq. 21/34 defines A = (I + T)^{-1}, and
-    # Eq. 22/34 pushes A onto the two S0-independent right-hand sides:
-    # Y = A Ē (erase side), U = A Z (write side), so that later
-    # R = U − Y S0 assembles the residuals for ANY chunk-entry state.
-    #
-    # HOW THE ROW RECURRENCES OF App. A.4 WORK. Expanding (I + T) Y = Ē and
-    # (I + T) U = Z row by row gives
-    #     y_rᵀ = ē_rᵀ − Σ_{s<r} (ē_rᵀ k̄_s) y_sᵀ,      Eq. 45
-    #     u_rᵀ = z_rᵀ − Σ_{s<r} (ē_rᵀ k̄_s) u_sᵀ,      Eq. 46
-    # i.e. row r starts from its own factor (ē_r or z_r) and subtracts each
-    # earlier, ALREADY-CORRECTED row s weighted by the overlap T_rs = ē_rᵀ k̄_s.
-    # Computing row 1, then row 2 from row 1, then row 3 from rows 1-2, ... is
-    # exactly forward substitution — solve_triangular below runs that C-step
-    # chain in one call. Both recurrences share the SAME coefficients T and
-    # differ only in the starting vectors, which is why one solve over the
-    # stacked RHS [Ē | Z] yields both auxiliaries at once (App. A.4: "the same
-    # WY inverse can be shared by the erase-side and write-side computations").
-    #
-    # The explicit inverse A is never materialized: that would cost a C-RHS
-    # solve plus two matmuls and is numerically worse than solving directly.
-    # Y and U are independent of S0 — that is what lets all chunks precompute
-    # them in parallel before the sequential scan.
-    YU = jax.scipy.linalg.solve_triangular(
-        eye + T, jnp.concatenate([Ebar, Z], axis=-1),
-        lower=True, unit_diagonal=True,
-    )
-    Y, U = YU[..., :dk], YU[..., dk:]  # Y: [N, C, dk], U: [N, C, dv]
-
-    # Eq. 25/43:  (A_qk)_rs = 1_{r≥s} q_rᵀ Diag(γ_r/γ_s) k_s.      [N, C, C]
-    # Decay-aware causal attention scores: query r attends to the write at
-    # s ≤ r with the key contracted channel-wise by the decay accumulated
-    # between s and r. tril INCLUDES the diagonal (a token reads its own
-    # write, ratio = 1).
-    Aqk = jnp.tril(Qg @ Kbar.swapaxes(-1, -2))
-
-    # Eq. 23/41:  (K_tail)_r = (γ_C/γ_r) ⊙ k_r.                   [N, C, dk]
-    # The write at step r keeps decaying for the rest of the chunk, so it
-    # enters the end-of-chunk state with the leftover factor γ_C/γ_r.
-    # Literal paper form: under strong decay both γ's underflow and this
-    # ratio becomes 0/0 = NaN — the other cores form it in log-space as
-    # exp(G_C − G_r) instead.
-    Ktail = k * (gamma_C[:, None, :] / gamma)
-
-    # ---- Cross-chunk recurrence: the ONLY sequential part -----------------
-    # S is the raw chunk-entry state S_[n] (NOT decay-normalized); each step
-    # is three small matmuls.
-    def chunk_step(
-        S: jax.Array,
-        inp: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
-    ) -> tuple[jax.Array, jax.Array]:
-        # S: [dk, dv].  Per-chunk slices:
-        # Y_n [C, dk], U_n [C, dv], Aqk_n [C, C], Qg_n [C, dk],
-        # Ktail_n [C, dk], gamma_C_n [dk].
-        Y_n, U_n, Aqk_n, Qg_n, Ktail_n, gamma_C_n = inp
-
-        # Eq. 35:  R = U − Y S0.                                    [C, dv]
-        # Row r is the residual ρ_r = z_r − ē_rᵀ Ŝ_{r−1} (Eq. 37): what is
-        # left to write at step r after subtracting what the decayed,
-        # already-edited memory returns along the erase direction. U covers
-        # the intra-chunk part; −Y S0 corrects for inherited content. R is
-        # exactly the chunk's set of rank-one updates:
-        # Ŝ_r = S0 + Σ_{s≤r} k̄_s ρ_sᵀ (Eq. 36).
-        R = U_n - Y_n @ S
-
-        # Eq. 24/44:  O = Q_γ S0 + A_qk R.                          [C, dv]
-        # Two read paths: history (query reads the chunk-entry state through
-        # its decay γ_r) + intra-chunk (causal scores against this chunk's
-        # residual writes). This is o_r = S_rᵀ q_r unrolled through Eq. 36.
-        o = Qg_n @ S + Aqk_n @ R
-
-        # Eq. 23/40:  S_[n+1] = Diag(γ_C) S0 + K_tailᵀ R.          [dk, dv]
-        # Hand-off to the next chunk: old state after a full chunk of decay
-        # (erasures folded into R), plus every residual write re-keyed by
-        # its tail-decayed key. gamma_C broadcasts over key-channel rows.
-        S_new = gamma_C_n[:, None] * S + Ktail_n.T @ R
-
-        return S_new, o
-
-    # scan carries S across chunks; stacked outputs o: [N, C, dv].
-    S_final, o = lax.scan(chunk_step, S0, (Y, U, Aqk, Qg, Ktail, gamma_C))
-    return o.reshape(L, dv), S_final
+    return _cross_chunk_scan(S0, Y, U, Aqk, Qg, Ktail, gamma_C)
 
 
 def _chunkwise_single_centered(
@@ -633,24 +577,7 @@ def _chunkwise_single_centered(
 
     Args / returns: identical to _chunkwise_single_faithful.
     """
-    L, dk = k.shape
-    dv = v.shape[-1]
-    C = chunk_size
-    if C <= 0 or L % C:
-        raise ValueError(
-            f"chunk_size={C} must be a positive divisor of the sequence "
-            f"length L={L}")
-    N = L // C  # number of chunks
-
-    def to_chunks(x):
-        # [L, d] -> [N, C, d]
-        return x.reshape(N, C, x.shape[-1]).astype(D_TYPE)
-
-    q, k, v = to_chunks(q), to_chunks(k), to_chunks(v)   # [N, C, dk/dk/dv]
-    g, b, w = to_chunks(g), to_chunks(b), to_chunks(w)   # [N, C, dk/dk/dv]
-
-    eye = jnp.eye(C, dtype=D_TYPE)  # [C, C]
-    S0 = S0.astype(D_TYPE)          # [dk, dv]
+    (q, k, v, g, b, w), S0 = _chunk_inputs(q, k, v, g, b, w, S0, chunk_size)
 
     # Eq. 18/30:  G_r = Σ_{i≤r} g_i, within-chunk cumulative log-decay.
     # [N, C, dk]; see the faithful variant for the γ_r/γ_s reading.
@@ -667,7 +594,7 @@ def _chunkwise_single_centered(
     Gc = G - 0.5 * G_C[:, None, :]
 
     # exp(c) ≤ 1: per-chunk state pre-scale that re-attaches the shift
-    # against S0 inside chunk_step.                                  [N, dk]
+    # against S0 inside the cross-chunk scan.                        [N, dk]
     delta = jnp.exp(0.5 * G_C)
 
     # Eq. 19/32/33 centered:  K̄ = exp(c−G) ⊙ K (paper: γ^{-1} ⊙ K).
@@ -691,17 +618,8 @@ def _chunkwise_single_centered(
     # Overlap of edit r with the decayed write s; centering cancels here.
     T = jnp.tril(Ebar @ Kbar.swapaxes(-1, -2), k=-1)
 
-    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē,  U = (I + T)^{-1} Z — the WY
-    # auxiliaries, one forward substitution over the stacked RHS [Ē | Z].
-    # The row recurrences Eqs. 45/46 share the coefficients T, so one solve
-    # yields both; see _chunkwise_single_stacked_RHS_solve for the full
-    # derivation. Y and U are independent of S0 — that is what lets all
-    # chunks precompute them in parallel before the sequential scan.
-    YU = jax.scipy.linalg.solve_triangular(
-        eye + T, jnp.concatenate([Ebar, Z], axis=-1),
-        lower=True, unit_diagonal=True,
-    )
-    Y, U = YU[..., :dk], YU[..., dk:]  # Y: [N, C, dk], U: [N, C, dv]
+    # Eqs. 21/34 + 22/34: one stacked-RHS forward substitution (_wy_solve).
+    Y, U = _wy_solve(T, Ebar, Z)
 
     # Eq. 25/43:  (A_qk)_rs = 1_{r≥s} q_rᵀ Diag(γ_r/γ_s) k_s.      [N, C, C]
     # Decay-aware causal scores; exp(Gc_r)·exp(−Gc_s) = exp(G_r − G_s), so
@@ -713,38 +631,8 @@ def _chunkwise_single_centered(
     # underflowed denormals (0/0 → NaN).                          [N, C, dk]
     Ktail = k * jnp.exp(G_C[:, None, :] - G)
 
-    # ---- Cross-chunk recurrence: the ONLY sequential part -----------------
-    def chunk_step(
-        S: jax.Array,
-        inp: tuple[jax.Array, ...],
-    ) -> tuple[jax.Array, jax.Array]:
-        # S: [dk, dv].  Per-chunk slices: Y_n [C, dk], U_n [C, dv],
-        # Aqk_n [C, C], Qg_n [C, dk], Ktail_n [C, dk],
-        # gamma_C_n [dk], delta_n [dk].
-        Y_n, U_n, Aqk_n, Qg_n, Ktail_n, gamma_C_n, delta_n = inp
-
-        # diag(exp(c)) S0 — re-attaches the centering shift so that
-        # Y_n S_c == (A Ē) S0 and Qg_n S_c == Q_γ S0 hold exactly. [dk, dv]
-        S_c = delta_n[:, None] * S
-
-        # Eq. 35:  R = U − Y S0 — stacked residuals ρ_r = z_r − ē_rᵀ Ŝ_{r−1}
-        # (Eq. 37): the rank-one updates this chunk applies,
-        # Ŝ_r = S0 + Σ_{s≤r} k̄_s ρ_sᵀ (Eq. 36).                     [C, dv]
-        R = U_n - Y_n @ S_c
-
-        # Eq. 24/44:  O = Q_γ S0 + A_qk R — history read + intra-chunk read;
-        # o_r = S_rᵀ q_r (Eq. 1) unrolled through Eq. 36.            [C, dv]
-        o = Qg_n @ S_c + Aqk_n @ R
-
-        # Eq. 23/40:  S_[n+1] = Diag(γ_C) S0 + K_tailᵀ R — decayed carry of
-        # the old state plus the tail-decayed residual writes.      [dk, dv]
-        S_new = gamma_C_n[:, None] * S + Ktail_n.T @ R
-
-        return S_new, o
-
-    # scan carries S across chunks; stacked outputs o: [N, C, dv].
-    S_final, o = lax.scan(chunk_step, S0, (Y, U, Aqk, Qg, Ktail, gamma_C, delta))
-    return o.reshape(L, dv), S_final
+    # delta re-attaches the centering shift against S0 (see _cross_chunk_scan).
+    return _cross_chunk_scan(S0, Y, U, Aqk, Qg, Ktail, gamma_C, delta=delta)
 
 
 def _chunkwise_single_pairwise(
@@ -781,24 +669,8 @@ def _chunkwise_single_pairwise(
 
     Args / returns: identical to _chunkwise_single_faithful.
     """
-    L, dk = k.shape
-    dv = v.shape[-1]
+    (q, k, v, g, b, w), S0 = _chunk_inputs(q, k, v, g, b, w, S0, chunk_size)
     C = chunk_size
-    if C <= 0 or L % C:
-        raise ValueError(
-            f"chunk_size={C} must be a positive divisor of the sequence "
-            f"length L={L}")
-    N = L // C  # number of chunks
-
-    def to_chunks(x):
-        # [L, d] -> [N, C, d]
-        return x.reshape(N, C, x.shape[-1]).astype(D_TYPE)
-
-    q, k, v = to_chunks(q), to_chunks(k), to_chunks(v)   # [N, C, dk/dk/dv]
-    g, b, w = to_chunks(g), to_chunks(b), to_chunks(w)   # [N, C, dk/dk/dv]
-
-    eye = jnp.eye(C, dtype=D_TYPE)  # [C, C]
-    S0 = S0.astype(D_TYPE)          # [dk, dv]
 
     # Eq. 18/30:  G_r = Σ_{i≤r} g_i, within-chunk cumulative log-decay.
     # [N, C, dk]; see the faithful variant for the γ_r/γ_s reading.
@@ -856,47 +728,15 @@ def _chunkwise_single_pairwise(
     # Eq. 8, 20/33:  Z = W ⊙ V — gated write targets.             [N, C, dv]
     Z = w * v
 
-    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē,  U = (I + T)^{-1} Z — the WY
-    # auxiliaries, one forward substitution over the stacked RHS [Ē | Z].
-    # The row recurrences Eqs. 45/46 share the coefficients T, so one solve
-    # yields both; see _chunkwise_single_stacked_RHS_solve for the full
-    # derivation. Y and U are independent of S0 — that is what lets all
-    # chunks precompute them in parallel before the sequential scan.
-    YU = jax.scipy.linalg.solve_triangular(
-        eye + T, jnp.concatenate([Ebar, Z], axis=-1),
-        lower=True, unit_diagonal=True,
-    )
-    Y, U = YU[..., :dk], YU[..., dk:]  # Y: [N, C, dk], U: [N, C, dv]
+    # Eqs. 21/34 + 22/34: one stacked-RHS forward substitution (_wy_solve).
+    Y, U = _wy_solve(T, Ebar, Z)
 
     # Eq. 23/41:  (K_tail)_r = (γ_C/γ_r) ⊙ k_r, formed in log-space as
     # exp(G_C − G_r) ≤ 1.                                        [N, C, dk]
     Ktail = k * jnp.exp(G_C[:, None, :] - G)
 
-    # ---- Cross-chunk recurrence: the ONLY sequential part -----------------
-    # Identical to the faithful variant (raw chunk-entry state, no S0
-    # pre-scaling) since Ē and Q_γ carry the true absolute γ here.
-    def chunk_step(
-        S: jax.Array,
-        inp: tuple[jax.Array, ...],
-    ) -> tuple[jax.Array, jax.Array]:
-        # S: [dk, dv].  Per-chunk slices: Y_n [C, dk], U_n [C, dv],
-        # Aqk_n [C, C], Qg_n [C, dk], Ktail_n [C, dk], gamma_C_n [dk].
-        Y_n, U_n, Aqk_n, Qg_n, Ktail_n, gamma_C_n = inp
-
-        # Eq. 35:  R = U − Y S0 — stacked residuals ρ_r (Eq. 37).   [C, dv]
-        R = U_n - Y_n @ S
-
-        # Eq. 24/44:  O = Q_γ S0 + A_qk R — history + intra-chunk.  [C, dv]
-        o = Qg_n @ S + Aqk_n @ R
-
-        # Eq. 23/40:  S_[n+1] = Diag(γ_C) S0 + K_tailᵀ R.          [dk, dv]
-        S_new = gamma_C_n[:, None] * S + Ktail_n.T @ R
-
-        return S_new, o
-
-    # scan carries S across chunks; stacked outputs o: [N, C, dv].
-    S_final, o = lax.scan(chunk_step, S0, (Y, U, Aqk, Qg, Ktail, gamma_C))
-    return o.reshape(L, dv), S_final
+    # Ē and Q_γ carry the true absolute γ here, so no delta pre-scale.
+    return _cross_chunk_scan(S0, Y, U, Aqk, Qg, Ktail, gamma_C)
 
 
 def _chunkwise_single_subchunking(
@@ -943,29 +783,15 @@ def _chunkwise_single_subchunking(
     Returns:
       (O: [L, dv], S_final: [dk, dv])
     """
-    L, dk = k.shape
-    dv = v.shape[-1]
     C = chunk_size
     c = sub_chunk_size
-    if C <= 0 or L % C:
-        raise ValueError(
-            f"chunk_size={C} must be a positive divisor of the sequence "
-            f"length L={L}")
     if c <= 0 or C % c:
         raise ValueError(
             f"sub_chunk_size={c} must be a positive divisor of chunk_size={C}")
-    N = L // C   # number of chunks
+    (q, k, v, g, b, w), S0 = _chunk_inputs(q, k, v, g, b, w, S0, chunk_size)
+    N, _, dk = k.shape
     M = C // c   # sub-blocks per chunk
 
-    def to_chunks(x):
-        # [L, d] -> [N, C, d]
-        return x.reshape(N, C, x.shape[-1]).astype(D_TYPE)
-
-    q, k, v = to_chunks(q), to_chunks(k), to_chunks(v)   # [N, C, dk/dk/dv]
-    g, b, w = to_chunks(g), to_chunks(b), to_chunks(w)   # [N, C, dk/dk/dv]
-
-    eye = jnp.eye(C, dtype=D_TYPE)  # [C, C]
-    S0 = S0.astype(D_TYPE)          # [dk, dv]
     e = b * k                       # Eq. 8: erase directions   [N, C, dk]
 
     # Eq. 18/30:  G_r = Σ_{i≤r} g_i, within-chunk cumulative log-decay.
@@ -1048,43 +874,15 @@ def _chunkwise_single_subchunking(
     Qg = gamma * q          # Eq. 24/43:  Q_γ = γ ⊙ Q            [N, C, dk]
     Z = w * v               # Eq. 8, 20/33:  Z = W ⊙ V           [N, C, dv]
 
-    # Eq. 21/34 + 22/34:  Y = (I + T)^{-1} Ē, U = (I + T)^{-1} Z — the WY
-    # auxiliaries, solved at FULL chunk size C (the sub-chunking only
-    # changed how T's entries were produced). Same triangular system, two
-    # right-hand sides (Eqs. 45/46): one batched forward substitution over
-    # the stacked RHS [Ē | Z], no explicit inverse materialized.
-    YU = jax.scipy.linalg.solve_triangular(
-        eye + T, jnp.concatenate([Ebar, Z], axis=-1),
-        lower=True, unit_diagonal=True,
-    )
-    Y, U = YU[..., :dk], YU[..., dk:]  # Y: [N, C, dk], U: [N, C, dv]
+    # Eqs. 21/34 + 22/34, solved at FULL chunk size C (the sub-chunking only
+    # changed how T's entries were produced): one stacked-RHS forward
+    # substitution (_wy_solve).
+    Y, U = _wy_solve(T, Ebar, Z)
 
     # Eq. 23/41:  (K_tail)_r = exp(G_C − G_r) ⊙ k_r ≤ k_r.       [N, C, dk]
     Ktail = k * jnp.exp(G_C[:, None, :] - G)
 
-    # ---- Cross-chunk recurrence: the ONLY sequential part -----------------
-    def chunk_step(
-        S: jax.Array,
-        inp: tuple[jax.Array, ...],
-    ) -> tuple[jax.Array, jax.Array]:
-        # S: [dk, dv].  Per-chunk slices: Y_n [C, dk], U_n [C, dv],
-        # Aqk_n [C, C], Qg_n [C, dk], Ktail_n [C, dk], gamma_C_n [dk].
-        Y_n, U_n, Aqk_n, Qg_n, Ktail_n, gamma_C_n = inp
-
-        # Eq. 35:  R = U − Y S0 — stacked residuals ρ_r (Eq. 37).   [C, dv]
-        R = U_n - Y_n @ S
-
-        # Eq. 24/44:  O = Q_γ S0 + A_qk R — history + intra-chunk.  [C, dv]
-        o = Qg_n @ S + Aqk_n @ R
-
-        # Eq. 23/40:  S_[n+1] = Diag(γ_C) S0 + K_tailᵀ R.          [dk, dv]
-        S_new = gamma_C_n[:, None] * S + Ktail_n.T @ R
-
-        return S_new, o
-
-    # scan carries S across chunks; stacked outputs o: [N, C, dv].
-    S_final, o = lax.scan(chunk_step, S0, (Y, U, Aqk, Qg, Ktail, gamma_C))
-    return o.reshape(L, dv), S_final
+    return _cross_chunk_scan(S0, Y, U, Aqk, Qg, Ktail, gamma_C)
 
 
 def _batchify(fn):

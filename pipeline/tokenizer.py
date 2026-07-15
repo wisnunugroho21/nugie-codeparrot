@@ -53,8 +53,11 @@ class HFTokenizer:
         eos = self._tok.eos_token_id
         if eos is None:
             eos = self._tok.bos_token_id
-        self.eos_id = int(eos) if eos is not None else self._tok.vocab_size - 1
-        self.vocab_size = int(self._tok.vocab_size)
+        # len(tok) counts added special tokens; .vocab_size excludes them. Ids up
+        # to len(tok)-1 can appear in encoded text, so the model's embedding (and
+        # meta.json's vocab check) must be sized by len(tok).
+        self.vocab_size = len(self._tok)
+        self.eos_id = int(eos) if eos is not None else self.vocab_size - 1
 
     def encode(self, text: str) -> list[int]:
         return self._tok.encode(text, add_special_tokens=False)

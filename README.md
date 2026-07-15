@@ -44,8 +44,12 @@ pipeline/
 
 ```bash
 pip install -r requirements.txt          # CPU
+# or:  pip install -e .                  # same deps, plus importable from anywhere
 # GPU: also install a CUDA jax, e.g.  pip install -U "jax[cuda12]"
 ```
+
+Run the test suite (core-vs-oracle verification, streaming-vs-training
+consistency, MoE dispatch) with `pytest`.
 
 ## Quick start (offline, ~minutes on a CPU)
 
@@ -133,6 +137,9 @@ logits, and loss stay fp32 for numerical stability.
 ## Notes
 
 - Generation uses the model's streaming path: GDN-2 layers carry a fixed-size
-  recurrent state (O(1) per token), MLA layers a growing latent cache.
+  recurrent state (O(1) per token), MLA layers a growing latent cache. Decoding
+  is greedy by default; pass `--temperature` (and optionally `--top-p`) to
+  sample, and `--seed` to vary samples. Generation stops early at the training
+  EOS (the document separator).
 - `model.vocab_size` **must** equal the tokenizer's vocab; `train.py` checks this
   against `meta.json` and aborts on mismatch.
