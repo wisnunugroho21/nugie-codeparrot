@@ -1,40 +1,37 @@
 """
-Muon optimizer setup for the Kimi-Linear-GDN2 code LM (Optax + Flax NNX).
+MuonClip optimizer setup for the Kimi-Linear-GDN2 code LM (Flax NNX).
 
-Moonlight ("Muon is Scalable for LLM Training", arXiv:2502.16982) — the Kimi
-lineage's training recipe, also used for Kimi K2 — optimizes all hidden WEIGHT
-MATRICES with Muon and everything else with AdamW. Muon takes the momentum-
-averaged gradient of a matrix and orthogonalizes it with a few Newton-Schulz
-iterations (approximate steepest descent under the spectral norm), which lets
-every direction of the update contribute instead of being dominated by a few
-large singular values. Orthogonalization is only defined for matrices, hence
-the split:
+Kimi Linear / Kimi K2 train with Muon and MuonClip; both are implemented FROM
+SCRATCH in pipeline/muon.py (Newton-Schulz orthogonalization, the Moonlight
+weight-decay + consistent-RMS adjustments, a from-scratch AdamW side, and the
+QK-Clip math). This module is the model-aware glue:
 
-    Muon : parameters that ACT as matrices in a matmul — all Linear kernels,
-           and the MoE's stacked expert tensors [E, d_in, d_out] seen as E
-           independent matrices (batched via MuonDimensionNumbers).
-    AdamW: everything else — the embedding and LM head (Moonlight keeps both
-           on AdamW), and all non-matrix parameters: biases, RMSNorm gains,
-           the GDN-2 decay parameters A_log / dt_bias, and the depthwise
-           short-conv kernels (shape [width, 1, C] — not a matmul matrix).
+  * `_label` decides, per parameter, which side updates it — the Moonlight
+    split:
 
-Two Moonlight adjustments make Muon a drop-in for an AdamW setup:
-  * weight decay inside the Muon update (their Sec. 2.2), and
-  * consistent-RMS scaling: each update is scaled by 0.2·sqrt(max(fan_in,
-    fan_out)) so its RMS matches AdamW's empirical ~0.2 regardless of shape —
-    letting Muon reuse AdamW's learning rate and weight-decay values unchanged.
+      Muon : parameters that ACT as matrices in a matmul — all Linear kernels,
+             and the MoE's stacked expert tensors [E, d_in, d_out], which the
+             Newton-Schulz step treats as E independent matrices (it operates
+             on the last two axes; leading axes are batch).
+      AdamW: everything else — the embedding and LM head (Moonlight keeps both
+             on AdamW), and all non-matrix parameters: biases, RMSNorm gains,
+             the GDN-2 decay parameters A_log / dt_bias, and the depthwise
+             short-conv kernels (shape [width, 1, C] — not a matmul matrix).
 
-`optax.contrib.muon` implements all of the above (including the internal
-Muon/AdamW split); this module's only real job is the classification rule
-`_muon_spec` saying which parameter is a hidden weight matrix.
+  * `make_optimizer` assembles global-norm clip -> muon(...) into an
+    nnx.Optimizer. Muon's consistent-RMS scaling matches its update RMS to
+    AdamW's ~0.2, so the SAME learning rate / weight decay drive both sides —
+    the YAML knobs carry over unchanged. Weight decay touches ONLY the
+    Muon-side matrices (embed/head/biases/norms/decays are not pulled to 0).
 
-A pleasant side effect vs the previous plain `optax.adamw(weight_decay=...)`:
-weight decay now touches ONLY the weight matrices — the embedding, LM head,
-biases, norm gains, and the decay/gate parameters are no longer pulled toward
-zero. (Previously the >=2-D mask decayed the embedding + LM head as well.)
+  * `apply_qk_clip` is the "Clip" in MuonClip (Kimi K2 Sec. 2.1): called by
+    the train step right after each optimizer update, it rescales any MLA
+    attention head whose max logit exceeded tau in that step's forward pass,
+    capping the logits at the weight level. See pipeline/muon.py for why the
+    full factor goes on the query projection in our absorbed-MLA form.
 
 Used by pipeline/train.py's build_optimizer; the learning rate / weight decay /
-grad-clip / Adam betas all flow through from the run's TrainConfig unchanged.
+grad-clip / Adam betas / Muon knobs all flow through from TrainConfig.
 """
 
 from __future__ import annotations
@@ -42,13 +39,8 @@ from __future__ import annotations
 import jax
 import optax
 from flax import nnx
-from optax.contrib import MuonDimensionNumbers
 
-# 2D matrix in the x @ W convention: rows are reduced, columns are the output.
-_MATRIX = MuonDimensionNumbers(reduction_axis=0, output_axis=1)
-# Stacked MoE expert weights [E, d_in, d_out]: axes 1/2 form the matrix, the
-# unlisted axis 0 is an implicit batch axis (optax vmaps Newton-Schulz over it).
-_EXPERT_STACK = MuonDimensionNumbers(reduction_axis=1, output_axis=2)
+from pipeline.muon import clip_query_kernel, muon, qk_clip_factors
 
 
 def _path_names(path) -> set[str]:
@@ -63,29 +55,28 @@ def _path_names(path) -> set[str]:
     return names
 
 
-def _muon_spec(path, leaf) -> MuonDimensionNumbers | None:
-    """Classify one parameter: a MuonDimensionNumbers spec => Muon updates it
-    (with that matrix layout); None => it goes to the AdamW side."""
+def _label(path, leaf) -> str:
+    """Classify one parameter: "muon" (a hidden weight matrix) or "adamw"."""
     names = _path_names(path)
 
     # Moonlight: embedding + LM head stay on AdamW. A_log is 2D [H, dk] but is a
     # per-channel decay parameter, not a matmul weight — AdamW as well.
     if names & {"embed", "lm_head", "A_log"}:
-        return None
+        return "adamw"
 
     if names & {"w_in", "w_out"} and leaf.ndim == 3:
-        return _EXPERT_STACK  # MoE experts: E stacked matrices
+        return "muon"  # MoE experts: E stacked matrices, batched Newton-Schulz
 
     if leaf.ndim == 2:
-        return _MATRIX  # every Linear kernel (projections, gates, router, ...)
+        return "muon"  # every Linear kernel (projections, gates, router, ...)
 
     # Biases, RMSNorm gains, dt_bias (1D) and depthwise conv kernels (3D but
     # not a matmul matrix) -> AdamW.
-    return None
+    return "adamw"
 
 
-def _spec_tree(params):
-    return jax.tree_util.tree_map_with_path(_muon_spec, params)
+def _label_tree(params):
+    return jax.tree_util.tree_map_with_path(_label, params)
 
 
 def make_optimizer(
@@ -98,38 +89,39 @@ def make_optimizer(
     adam_b2: float = 0.95,
     eps: float = 1e-8,
     muon_beta: float = 0.95,
+    muon_ns_steps: int = 5,
     verbose: bool = True,
 ) -> nnx.Optimizer:
     """Global-norm clip -> Muon (matrices) / AdamW (the rest), NNX-wrapped.
 
     `learning_rate` may be a float or an Optax schedule; thanks to Muon's
     consistent-RMS scaling it is the SAME learning-rate scale you would give
-    AdamW. `weight_decay` / `clip_norm` / `adam_b1` / `adam_b2` / `eps` come
-    straight from the run's TrainConfig so the YAML knobs still drive the
-    optimizer. wrt=nnx.Param: only Param leaves get optimizer state (the MoE
-    router_bias is a plain Variable updated by hand in the training loop, so it
-    is correctly left out).
+    AdamW. The other knobs come straight from the run's TrainConfig so the
+    YAML still drives the optimizer. wrt=nnx.Param: only Param leaves get
+    optimizer state (the MoE router_bias is a plain Variable updated by hand
+    in the training loop, so it is correctly left out).
     """
     tx = optax.chain(
         optax.clip_by_global_norm(clip_norm),
-        optax.contrib.muon(
-            learning_rate=learning_rate,
-            beta=muon_beta,           # Muon momentum (matrices)
-            eps=eps,
+        muon(
+            learning_rate,
+            _label_tree,
+            beta=muon_beta,             # Muon momentum (matrices)
+            ns_steps=muon_ns_steps,     # Newton-Schulz iterations
             weight_decay=weight_decay,  # decays ONLY the Muon-side matrices
-            adam_weight_decay=0.0,    # embed/head/biases/norms/decays: no decay
             adam_b1=adam_b1,
             adam_b2=adam_b2,
-            consistent_rms=0.2,       # Moonlight: match AdamW's update RMS
-            muon_weight_dimension_numbers=_spec_tree,
+            eps=eps,
+            adam_weight_decay=0.0,      # embed/head/biases/norms/decays: no decay
+            consistent_rms=0.2,         # Moonlight: match AdamW's update RMS
         ),
     )
 
     if verbose:
         params = nnx.state(model, nnx.Param)
         leaves = jax.tree_util.tree_leaves_with_path(params)
-        n_muon = sum(l.size for p, l in leaves if _muon_spec(p, l) is not None)
-        n_adam = sum(l.size for p, l in leaves if _muon_spec(p, l) is None)
+        n_muon = sum(l.size for p, l in leaves if _label(p, l) == "muon")
+        n_adam = sum(l.size for p, l in leaves if _label(p, l) == "adamw")
         print(
             f"optimizer: Muon on {n_muon:,} matrix params, "
             f"AdamW on {n_adam:,} others (embed/head/biases/norms/decays)"
@@ -139,3 +131,37 @@ def make_optimizer(
     # (nnx.Variable) is deliberately excluded — it is updated by the
     # aux-loss-free rule in the training loop instead.
     return nnx.Optimizer(model, tx, wrt=nnx.Param)
+
+
+# --------------------------------------------------------------------------- #
+#  QK-Clip: the post-step weight rescale that makes Muon -> MuonClip.
+# --------------------------------------------------------------------------- #
+def apply_qk_clip(model: nnx.Module, max_logits: jax.Array, tau: float) -> None:
+    """Rescale each MLA head whose max attention logit exceeded `tau`.
+
+    `max_logits` is the model forward's aux["mla_max_logits"]: [n_mla, Hq],
+    one row per full-attention layer in layer order (under data parallelism,
+    already pmax-ed across replicas). For each layer, head h is rescaled by
+    gamma_h = min(1, tau / S_h) on its w_q_uk column block; logits are linear
+    in that kernel, so the head's max logit becomes exactly min(S_h, tau).
+    Heads under the threshold get gamma = 1 (a no-op) — as training
+    stabilizes, this whole function converges to the identity.
+
+    Mutates the model in place (like the router-bias nudge in train.py); call
+    it right AFTER optimizer.update so the clip sees the just-updated weights'
+    logits at the next step.
+    """
+    mla_layers = [layer for layer in model.layers if layer.is_full_attn]
+    if len(mla_layers) != max_logits.shape[0]:
+        raise ValueError(
+            f"max_logits has {max_logits.shape[0]} rows but the model has "
+            f"{len(mla_layers)} full-attention layers."
+        )
+    for i, layer in enumerate(mla_layers):
+        attn = layer.token_mixer
+        gammas = qk_clip_factors(max_logits[i], tau)  # [Hq]
+        attn.w_q_uk.kernel.set_value(
+            clip_query_kernel(
+                attn.w_q_uk.kernel.get_value(), gammas, attn.head_dim
+            )
+        )

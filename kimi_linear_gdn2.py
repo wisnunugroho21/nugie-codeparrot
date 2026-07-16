@@ -190,20 +190,29 @@ class DecoderLayer(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
-        """x: [B, L, d_model] -> (x, aux_or_None).
+        """x: [B, L, d_model] -> (x, aux).
 
         `aux` carries the MoE load-balancing diagnostics the training loop
         needs (aux loss + per-expert token counts for the router-bias update).
+        On full-attention layers it also carries "attn_max_logits" [Hq] — the
+        per-head max attention logit, the QK-Clip statistic MuonClip rescales
+        against after each optimizer step (see pipeline/optimizer.py).
         """
         # --- token mixing (residual, pre-norm) ---
         h = self.norm1(x)
-        h = self.token_mixer(h)
+        if self.is_full_attn:
+            h, attn_max_logits = self.token_mixer(h)
+        else:
+            h = self.token_mixer(h)
+            attn_max_logits = None
         x = x + h
 
         # --- channel mixing (residual, pre-norm) ---
         y = self.norm2(x)
         m, aux = self.channel_mixer(y)
         x = x + m
+        if attn_max_logits is not None:
+            aux = dict(aux, attn_max_logits=attn_max_logits)
         return x, aux
 
     def init_cache(self, batch_size: int, max_len: int, dtype=jnp.float32):
@@ -277,14 +286,18 @@ class KimiLinear(nnx.Module):
 
         aux is ALWAYS returned (callers that don't need it just unpack `logits, _ =`):
             aux = {"aux_loss":   scalar, the MoE load-balancing loss summed over layers,
-                   "group_sizes": int[n_layers, E], per-expert token counts per layer}.
-        The training loop uses aux_loss (added to the CE loss) and group_sizes (to nudge
-        each MoE layer's router bias); eval/inference paths simply ignore it.
+                   "group_sizes": int[n_layers, E], per-expert token counts per layer,
+                   "mla_max_logits": f32[n_mla, Hq], per-head max attention logits of
+                                     each full-attention layer, in layer order}.
+        The training loop uses aux_loss (added to the CE loss), group_sizes (to nudge
+        each MoE layer's router bias), and mla_max_logits (MuonClip's QK-Clip rescale
+        after each optimizer step); eval/inference paths simply ignore it.
         """
         aux_loss: ArrayLike = 0.0
         group_sizes: list[
             ArrayLike
         ] = []  # one [E] vector per MoE layer, in layer order
+        mla_max_logits: list[ArrayLike] = []  # one [Hq] vector per MLA layer
 
         x = self.embed(input_ids)  # [B, L, d_model]
         for layer in self.layers:
@@ -292,13 +305,25 @@ class KimiLinear(nnx.Module):
 
             aux_loss = aux_loss + aux["aux_loss"]
             group_sizes.append(aux["group_sizes"])
+            if layer.is_full_attn:
+                mla_max_logits.append(aux["attn_max_logits"])
 
         x = self.norm_f(x)
         # Upcast logits to fp32 for a numerically stable softmax/cross-entropy under
         # bf16 compute (the lm_head matmul itself still runs in cfg.compute_dtype).
         logits = self.lm_head(x).astype(jnp.float32)  # [B, L, vocab]
 
-        return logits, {"aux_loss": aux_loss, "group_sizes": jnp.stack(group_sizes)}
+        return logits, {
+            "aux_loss": aux_loss,
+            "group_sizes": jnp.stack(group_sizes),
+            # Empty (0, Hq) when the schedule has no full-attention layers, so
+            # the aux contract is shape-stable for jit/shard_map either way.
+            "mla_max_logits": (
+                jnp.stack(mla_max_logits)
+                if mla_max_logits
+                else jnp.zeros((0, self.cfg.mla_num_q_heads), jnp.float32)
+            ),
+        }
 
     # ----------------------------------------------------------------------- #
     #  Streaming / inference.  Each layer carries its own cache (GDN-2: fixed-size

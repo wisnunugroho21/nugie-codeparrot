@@ -69,15 +69,24 @@ class TrainConfig:
     batch_size: int = 16
     max_steps: int = 10000
 
-    # --- Optimizer (AdamW) ---
+    # --- Optimizer (MuonClip: our own Muon on the weight matrices + AdamW on
+    # the rest + QK-Clip on the MLA heads; see pipeline/muon.py) ---
+    # Muon's consistent-RMS scaling matches AdamW's update RMS, so lr /
+    # weight_decay are the same scale you would give plain AdamW.
     lr: float = 3e-4
     min_lr: float = 3e-5
     warmup_steps: int = 500
     weight_decay: float = 0.1
-    beta1: float = 0.9
+    beta1: float = 0.9  # AdamW side (embed/head/biases/norms/decays)
     beta2: float = 0.95
     eps: float = 1e-8
     grad_clip: float = 1.0
+    muon_beta: float = 0.95  # Muon momentum (the weight matrices)
+    muon_ns_steps: int = 5  # Newton-Schulz iterations per update
+    # QK-Clip (the "Clip" in MuonClip): after each step, rescale any MLA head
+    # whose max attention logit exceeded tau. False => plain Muon.
+    qk_clip: bool = True
+    qk_clip_tau: float = 100.0  # Kimi K2's threshold
 
     # Aux-loss-free load-balancing: step size for the per-expert router-bias nudge
     # (DeepSeek-V3 style; applied outside the gradient each step).

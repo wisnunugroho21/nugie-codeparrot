@@ -36,6 +36,10 @@ def test_forward_shapes_and_aux(model):
     assert logits.shape == (2, 32, CFG.vocab_size)
     assert logits.dtype == jnp.float32
     assert aux["group_sizes"].shape == (CFG.n_layers, CFG.moe_n_routed)
+    # One MLA layer (n_layers=4, period=4 -> index 3); its per-head max
+    # attention logits feed MuonClip's QK-Clip.
+    assert aux["mla_max_logits"].shape == (1, CFG.mla_num_q_heads)
+    assert bool(jnp.all(jnp.isfinite(aux["mla_max_logits"])))
     assert bool(jnp.all(jnp.isfinite(logits)))
     assert count_params(model) > 0
 

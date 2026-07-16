@@ -34,8 +34,9 @@ pipeline/
   tokenizer.py     # byte-level or pretrained codeparrot BPE tokenizer
   prepare_data.py  # stage 1: tokenize CodeParrot -> packed memmap (.bin) + meta.json
   data.py          # stage 2: Grain random-access source + shuffled/batched loader
-  train.py         # stage 3: Optax Muon/AdamW loop + router-bias update + Orbax checkpoints
-  optimizer.py     # Muon (matrices) / AdamW (rest) split — the Moonlight recipe
+  train.py         # stage 3: MuonClip loop + QK-Clip + router-bias update + Orbax checkpoints
+  muon.py          # our own Muon + MuonClip: Newton-Schulz, AdamW side, QK-Clip math
+  optimizer.py     # Muon (matrices) / AdamW (rest) split + apply_qk_clip — the model-aware glue
   evaluate.py      # stage 4: restore checkpoint -> val loss/ppl + code generation
   checkpointing.py # Orbax CheckpointManager glue for the nnx optimizer state
 ```
@@ -116,15 +117,24 @@ by an EOS id) into one long stream on disk. `data.py` memory-maps it and exposes
 repeats, and prefetches. `seq_len` must be a multiple of `gdn_chunk_size` (64) and
 `≤ max_seq_len`; the config validates this at startup.
 
-**Optimization (Optax).** The Moonlight recipe (`optimizer.py`): **Muon** on the hidden
-weight matrices (all Linear kernels + the stacked MoE expert tensors), **AdamW** on
-everything else (embedding, LM head, RMSNorm gains, biases, and the GDN-2 decay params).
-Muon's consistent-RMS scaling means the AdamW learning rate carries over unchanged. A
-linear-warmup → cosine-decay LR schedule and global-norm gradient clipping wrap both;
-weight decay applies only to the Muon-side matrices. The loss is next-token cross-entropy
-**plus** the MoE load-balancing aux loss the model returns. After each step, the
-DeepSeek-V3 **aux-loss-free** router bias is nudged per layer from the realized expert
-token counts — a non-gradient update.
+**Optimization (MuonClip, from scratch).** Kimi Linear / Kimi K2's optimizers,
+reimplemented in `pipeline/muon.py` rather than taken from `optax.contrib`. **Muon**
+(Moonlight recipe): momentum orthogonalized by 5 Newton-Schulz iterations, applied to
+the hidden weight matrices (all Linear kernels + the stacked MoE expert tensors, which
+the batched Newton-Schulz treats as E independent matrices); a from-scratch **AdamW**
+side updates everything else (embedding, LM head, RMSNorm gains, biases, and the GDN-2
+decay params). Muon's consistent-RMS scaling (0.2·√max(fan_in, fan_out)) means one
+learning rate drives both sides. **QK-Clip** (the "Clip" in MuonClip, Kimi K2 Sec. 2.1)
+guards against Muon's exploding attention logits: each MLA layer's forward reports its
+per-head max attention logit, and after every optimizer step any head over `qk_clip_tau`
+(default 100) has its query projection rescaled by τ/S_h — capping the logits at the
+weight level while heads under the threshold are untouched (config: `train.qk_clip`,
+`train.qk_clip_tau`; the log line's `smax` column tracks the largest logit seen). A
+linear-warmup → cosine-decay LR schedule and global-norm gradient clipping wrap both
+sides; weight decay applies only to the Muon-side matrices. The loss is next-token
+cross-entropy **plus** the MoE load-balancing aux loss the model returns. After each
+step, the DeepSeek-V3 **aux-loss-free** router bias is nudged per layer from the
+realized expert token counts — a non-gradient update.
 
 **Checkpointing (Orbax).** The entire `nnx.Optimizer` (model params incl. the MoE
 router bias, Optax state, and step) is split into its array state and saved by an

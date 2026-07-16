@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dependencies = [
     "jax>=0.6",
     "flax>=0.10",
-    "optax>=0.2.4",           # Muon needs optax.contrib.muon w/ MuonDimensionNumbers + consistent_rms
+    "optax>=0.2.4",           # schedules/combinators only; Muon+MuonClip are our own (pipeline/muon.py)
     "orbax-checkpoint>=0.6",
     "grain>=0.2",
     "datasets>=2.19",         # streams codeparrot/codeparrot-train-v2-near-dedup from the HF Hub

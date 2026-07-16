@@ -126,8 +126,16 @@ class GroupedQueryLatentAttention(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        # x: (B, T, embed_dim)
+    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """x: (B, T, embed_dim) -> (output (B, T, embed_dim), max_logits (Hq,)).
+
+        `max_logits` is the QK-Clip statistic for MuonClip (see
+        pipeline/muon.py): each query head's largest attention logit — post
+        1/sqrt(d) scaling, i.e. the actual softmax input — maxed over the
+        batch and all causally kept (query, key) positions. The training loop
+        compares it against tau and rescales the head's w_q_uk block when it
+        exceeds it; eval/inference callers just drop it.
+        """
         batch_size, seq_length, _ = x.shape
 
         # --- Queries (already in the compressed K space via the absorbed W_UK) ---
@@ -173,6 +181,11 @@ class GroupedQueryLatentAttention(nnx.Module):
         causal_mask = jnp.tril(jnp.ones((seq_length, seq_length), dtype=bool))
         scaled_logits = jnp.where(causal_mask[None, None], scaled_logits, -jnp.inf)
 
+        # QK-Clip statistic: per-head max over batch and kept positions. The
+        # masked entries are -inf and the always-kept diagonal guarantees a
+        # finite max. (B, Hq, T, T) -> (Hq,).
+        max_logits = jnp.max(scaled_logits, axis=(0, 2, 3))
+
         # Softmax over the key axis -> per-query attention distribution (fp32), then
         # back to the compute dtype for the (bf16) weighted-sum matmul below.
         a = jax.nn.softmax(scaled_logits, axis=-1).astype(
@@ -196,7 +209,7 @@ class GroupedQueryLatentAttention(nnx.Module):
         # Absorbed W_UV . W_O: up-project the value latent and output-project.
         output = self.w_uv_o(weighted_latents)  # (B, T, embed_dim)
 
-        return output
+        return output, max_logits
 
     # ----------------------------------------------------------------------- #
     #  Streaming / inference.  Same softmax attention, but the KV latents of past

@@ -2,8 +2,8 @@
 Stage 3: the training loop.
 
 Ties everything together:
-    Grain batches  ->  KimiLinear (GDN-2)  ->  CE + MoE aux loss  ->  AdamW (Optax)
-    ->  aux-loss-free router-bias nudge  ->  Orbax checkpoint.
+    Grain batches  ->  KimiLinear (GDN-2)  ->  CE + MoE aux loss  ->  MuonClip
+    ->  QK-Clip + aux-loss-free router-bias nudge  ->  Orbax checkpoint.
 
 LOSS
     Next-token cross-entropy on the shifted targets, PLUS the summed MoE
@@ -13,9 +13,13 @@ LOSS
     load using that step's realized `group_sizes`.
 
 OPTIMIZER
-    AdamW with a linear warmup + cosine decay schedule and global-norm gradient
-    clipping. Weight decay is masked OFF for 1-D params (norms, biases, the GDN-2
-    A_log / dt_bias) and applied only to weight matrices — the standard recipe.
+    MuonClip (our from-scratch implementation, pipeline/muon.py) with a linear
+    warmup + cosine decay schedule and global-norm gradient clipping: Muon
+    (orthogonalized momentum) on the hidden weight matrices, AdamW on everything
+    else, and — after every optimizer update — QK-Clip: any MLA attention head
+    whose max logit exceeded tau this step has its query projection rescaled so
+    the logits stay capped (Kimi K2's fix for Muon's exploding attention logits).
+    Weight decay applies only to the Muon-side matrices.
 
 MIXED PRECISION
     Governed entirely by model.compute_dtype (fp32 by default; set "bfloat16" on a
@@ -72,7 +76,7 @@ from multi_latent_attention.moe import update_router_bias
 from pipeline import data as data_mod
 from pipeline.checkpointing import CheckpointManager
 from pipeline.config import ExperimentConfig
-from pipeline.optimizer import make_optimizer
+from pipeline.optimizer import apply_qk_clip, make_optimizer
 
 
 # --------------------------------------------------------------------------- #
@@ -95,9 +99,11 @@ def build_schedule(tc) -> optax.Schedule:
 
 def build_optimizer(model: KimiLinear, cfg: ExperimentConfig) -> nnx.Optimizer:
     """Global-norm clip -> Muon (hidden weight matrices) / AdamW (everything else),
-    the Moonlight recipe (see pipeline/optimizer.py). Muon's consistent-RMS scaling
-    keeps the same LR scale as the old plain-AdamW setup, so tc.lr is unchanged; weight
-    decay now touches only the Muon-side matrices (not embed/head/norms/biases)."""
+    our own MuonClip implementation (see pipeline/muon.py + pipeline/optimizer.py).
+    Muon's consistent-RMS scaling keeps the same LR scale as a plain-AdamW setup, so
+    tc.lr is unchanged; weight decay touches only the Muon-side matrices (not
+    embed/head/norms/biases). The QK-Clip half of MuonClip is applied inside the
+    train step (it needs each step's max attention logits), gated by tc.qk_clip."""
     tc = cfg.train
     return make_optimizer(
         model,
@@ -107,6 +113,8 @@ def build_optimizer(model: KimiLinear, cfg: ExperimentConfig) -> nnx.Optimizer:
         adam_b1=tc.beta1,
         adam_b2=tc.beta2,
         eps=tc.eps,
+        muon_beta=tc.muon_beta,
+        muon_ns_steps=tc.muon_ns_steps,
     )
 
 
@@ -114,12 +122,13 @@ def build_optimizer(model: KimiLinear, cfg: ExperimentConfig) -> nnx.Optimizer:
 #  Loss.
 # --------------------------------------------------------------------------- #
 def loss_fn(model: KimiLinear, batch: dict[str, jax.Array]):
-    """Returns (total_loss, (ce_loss, aux_loss, group_sizes)). total = CE + MoE aux."""
+    """Returns (total_loss, (ce_loss, aux_loss, group_sizes, mla_max_logits)).
+    total = CE + MoE aux; mla_max_logits feeds the post-step QK-Clip."""
     logits, aux = model(batch["input_ids"])  # logits fp32 [B,L,V]
     ce = optax.softmax_cross_entropy_with_integer_labels(
         logits, batch["target_ids"]).mean()
     total = ce + aux["aux_loss"]
-    return total, (ce, aux["aux_loss"], aux["group_sizes"])
+    return total, (ce, aux["aux_loss"], aux["group_sizes"], aux["mla_max_logits"])
 
 
 # Filter used to split the model into (graphdef, params, everything-else) for the
@@ -128,8 +137,12 @@ def loss_fn(model: KimiLinear, batch: dict[str, jax.Array]):
 _PARAM_FILTER = (nnx.Param, ...)
 
 
-def make_train_step(mesh: Mesh):
+def make_train_step(mesh: Mesh, qk_clip_tau: float | None = None):
     """Build the data-parallel train step bound to `mesh` (single axis "data").
+
+    `qk_clip_tau` enables MuonClip's QK-Clip: after each optimizer update, any
+    MLA head whose max attention logit (pmax-ed across replicas) exceeded tau
+    is rescaled (see pipeline/optimizer.py). None => plain Muon, no clipping.
 
     The forward + backward runs inside `shard_map`, so each device processes ONLY its
     shard of the batch and the MoE's token dispatch (argsort / ragged_dot / scatter-add
@@ -154,26 +167,32 @@ def make_train_step(mesh: Mesh):
             # Per-device forward/backward over this shard's local tokens.
             def _loss(p):
                 return loss_fn(nnx.merge(graphdef, p, rest), batch)
-            (total, (ce, aux_loss, group_sizes)), grads = jax.value_and_grad(
-                _loss, has_aux=True)(params)
+            (total, (ce, aux_loss, group_sizes, max_logits)), grads = (
+                jax.value_and_grad(_loss, has_aux=True)(params))
             # Re-sync replicas: average grads/loss, SUM the per-expert counts so the
-            # router-bias update sees the global batch's load (not one shard's).
+            # router-bias update sees the global batch's load (not one shard's), and
+            # MAX the attention logits so QK-Clip sees the global batch's worst head.
             grads = jax.lax.pmean(grads, "data")
             total = jax.lax.pmean(total, "data")
             ce = jax.lax.pmean(ce, "data")
             aux_loss = jax.lax.pmean(aux_loss, "data")
             group_sizes = jax.lax.psum(group_sizes, "data")
-            return grads, total, ce, aux_loss, group_sizes
+            max_logits = jax.lax.pmax(max_logits, "data")
+            return grads, total, ce, aux_loss, group_sizes, max_logits
 
-        grads, total, ce, aux_loss, group_sizes = shard_map(
+        grads, total, ce, aux_loss, group_sizes, max_logits = shard_map(
             _dp, mesh=mesh,
             in_specs=(P(), P(), P("data")),      # params/rest replicated; batch sharded
-            out_specs=(P(), P(), P(), P(), P()),  # all outputs already replica-reduced
+            out_specs=(P(),) * 6,                 # all outputs already replica-reduced
         )(params, rest, batch)
 
-        # Grads/counts are identical across replicas now, so these replicated updates
-        # keep params + router_bias in sync on every device.
+        # Grads/counts/logits are identical across replicas now, so these replicated
+        # updates keep params + router_bias in sync on every device.
         optimizer.update(model, grads)
+        if qk_clip_tau is not None:
+            # MuonClip's QK-Clip: rescale any MLA head whose max logit blew past
+            # tau this step. A per-head no-op once training is stable.
+            apply_qk_clip(model, max_logits, qk_clip_tau)
         for i, layer in enumerate(model.layers):
             moe = layer.channel_mixer
             moe.router_bias.set_value(
@@ -181,7 +200,11 @@ def make_train_step(mesh: Mesh):
                     moe.router_bias.get_value(), group_sizes[i], router_bias_lr)
             )
 
-        return total, ce, aux_loss
+        # smax: the single largest attention logit this step, a MuonClip health
+        # metric for the log line. -inf if the model has no full-attn layers.
+        smax = (jnp.max(max_logits) if max_logits.size
+                else jnp.array(-jnp.inf, jnp.float32))
+        return total, ce, aux_loss, smax
 
     return train_step
 
@@ -292,7 +315,8 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
     for obj in (model, optimizer, rngs):
         nnx.update(obj, jax.device_put(nnx.state(obj), repl_shard))
     shard_batch = lambda b: jax.device_put(b, data_shard)  # noqa: E731
-    train_step = make_train_step(mesh)
+    train_step = make_train_step(
+        mesh, qk_clip_tau=tc.qk_clip_tau if tc.qk_clip else None)
     eval_step = make_eval_step(mesh)
     if n_dev > 1:
         print(f"Data-parallel over {n_dev} devices "
@@ -311,14 +335,18 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
     schedule = build_schedule(tc)
     t0 = time.time()
     tokens_per_step = tc.batch_size * cfg.data.seq_len
-    running_ce = None  # device-side accumulator, host-synced only at log_every
+    running_ce = None  # device-side accumulators, host-synced only at log_every
+    running_smax = None  # largest attention logit seen since the last log line
     for step in range(start_step, tc.max_steps):
         batch = shard_batch(_to_jax(next(train_iter)))
-        total, ce, aux_loss = train_step(model, optimizer, batch, tc.router_bias_lr)
+        total, ce, aux_loss, smax = train_step(
+            model, optimizer, batch, tc.router_bias_lr)
         # Keep ce on device: calling float(ce) every step would block the host
         # on that step's result and defeat JAX's async dispatch (the device
         # could no longer run ahead while the host prepares the next batch).
         running_ce = ce if running_ce is None else running_ce + ce
+        running_smax = smax if running_smax is None else jnp.maximum(
+            running_smax, smax)
 
         if (step + 1) % tc.log_every == 0:
             mean_ce = float(running_ce) / tc.log_every  # the one host sync
@@ -327,8 +355,9 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
             lr = float(schedule(step))
             print(f"step {step + 1:>7}/{tc.max_steps} | loss {mean_ce:6.4f} | "
                   f"ppl {math.exp(mean_ce):8.2f} | aux {float(aux_loss):.4f} "
+                  f"| smax {float(running_smax):6.1f} "
                   f"| lr {lr:.2e} | {tok_s:,.0f} tok/s", flush=True)
-            running_ce, t0 = None, time.time()
+            running_ce, running_smax, t0 = None, None, time.time()
 
         if (step + 1) % tc.eval_every == 0:
             m = evaluate_loss(model, eval_step, make_val_iter(), tc.eval_steps,
