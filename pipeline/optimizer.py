@@ -24,17 +24,25 @@ QK-Clip math). This module is the model-aware glue:
     `orthogonalize` still supports that via batching, if the split is ever
     revisited).
 
-  * `make_optimizer` assembles global-norm clip -> muon(...) into an
-    nnx.Optimizer. Muon's consistent-RMS scaling matches its update RMS to
-    AdamW's ~0.2, so the SAME learning rate / weight decay drive both sides —
-    the YAML knobs carry over unchanged. Weight decay touches ONLY the
-    Muon-side matrices (embed/head/biases/norms/decays are not pulled to 0).
+  * `MuonClipOptimizer` packages MuonClip as ONE optimizer, the way Kimi K2
+    presents it (Sec. 2.1): a single `update(model, grads, max_logits)` call
+    runs the gradient update (global-norm clip -> Muon/AdamW) and then
+    QK-Clip — rescaling any MLA attention head whose max logit exceeded tau
+    in that step's forward pass, capping the logits at the weight level. The
+    optimizer owns tau; pass qk_clip_tau=None (or omit max_logits) for plain
+    Muon with no clipping.
 
-  * `apply_qk_clip` is the "Clip" in MuonClip (Kimi K2 Sec. 2.1): called by
-    the train step right after each optimizer update, it rescales any MLA
-    attention head whose max logit exceeded tau in that step's forward pass,
-    capping the logits at the weight level. See pipeline/muon.py for why the
-    full factor goes on the query projection in our absorbed-MLA form.
+  * `make_optimizer` assembles global-norm clip -> muon(...) into a
+    MuonClipOptimizer. Muon's consistent-RMS scaling matches its update RMS
+    to AdamW's ~0.2, so the SAME learning rate / weight decay drive both
+    sides — the YAML knobs carry over unchanged. Weight decay touches ONLY
+    the Muon-side matrices (embed/head/biases/norms/decays are not pulled
+    to 0).
+
+  * `apply_qk_clip` is the "Clip" half, kept callable on its own: it walks
+    the model's MLA layers and rescales each exceeding head. See
+    pipeline/muon.py for why the full factor goes on the query projection in
+    our absorbed-MLA form.
 
 Used by pipeline/train.py's build_optimizer; the learning rate / weight decay /
 grad-clip / Adam betas / Muon knobs all flow through from TrainConfig.
@@ -70,6 +78,36 @@ def _label_tree(params):
     return jax.tree_util.tree_map_with_path(_label, params)
 
 
+class MuonClipOptimizer(nnx.Optimizer):
+    """MuonClip as a single optimizer (Kimi K2 Sec. 2.1): Muon + QK-Clip.
+
+    `update(model, grads, max_logits)` applies the wrapped gradient
+    transformation (global-norm clip -> Muon on matrices / AdamW on the rest)
+    and then QK-Clip: any MLA head whose max attention logit `max_logits`
+    exceeded `qk_clip_tau` in the step's forward pass has its query
+    projection rescaled so the logits stay capped. `max_logits` is the
+    model's aux["mla_max_logits"] ([n_mla, Hq]; under data parallelism,
+    pmax-ed across replicas first).
+
+    QK-Clip is a WEIGHT-level edit, not a gradient term, so it lives here as
+    a post-update mutation rather than inside the optax chain. It degrades
+    gracefully: `qk_clip_tau=None` or omitting `max_logits` gives plain Muon.
+    `qk_clip_tau` is static Python metadata (not nnx state), so checkpoints
+    and replication treat this exactly like a plain nnx.Optimizer.
+    """
+
+    def __init__(self, model: nnx.Module, tx, *,
+                 qk_clip_tau: float | None = None, wrt=nnx.Param):
+        super().__init__(model, tx, wrt=wrt)
+        self.qk_clip_tau = qk_clip_tau
+
+    def update(self, model: nnx.Module, grads,
+               max_logits: jax.Array | None = None, **kwargs) -> None:
+        super().update(model, grads, **kwargs)
+        if self.qk_clip_tau is not None and max_logits is not None:
+            apply_qk_clip(model, max_logits, self.qk_clip_tau)
+
+
 def make_optimizer(
     model: nnx.Module,
     learning_rate,
@@ -81,16 +119,19 @@ def make_optimizer(
     eps: float = 1e-8,
     muon_beta: float = 0.95,
     muon_ns_steps: int = 5,
+    qk_clip_tau: float | None = None,
     verbose: bool = True,
-) -> nnx.Optimizer:
-    """Global-norm clip -> Muon (matrices) / AdamW (the rest), NNX-wrapped.
+) -> MuonClipOptimizer:
+    """Global-norm clip -> Muon (matrices) / AdamW (the rest) + QK-Clip,
+    packaged as a MuonClipOptimizer.
 
     `learning_rate` may be a float or an Optax schedule; thanks to Muon's
     consistent-RMS scaling it is the SAME learning-rate scale you would give
-    AdamW. The other knobs come straight from the run's TrainConfig so the
-    YAML still drives the optimizer. wrt=nnx.Param: only Param leaves get
-    optimizer state (the MoE router_bias is a plain Variable updated by hand
-    in the training loop, so it is correctly left out).
+    AdamW. `qk_clip_tau` arms QK-Clip (None = plain Muon, no clipping). The
+    other knobs come straight from the run's TrainConfig so the YAML still
+    drives the optimizer. wrt=nnx.Param: only Param leaves get optimizer
+    state (the MoE router_bias is a plain Variable updated by hand in the
+    training loop, so it is correctly left out).
     """
     tx = optax.chain(
         optax.clip_by_global_norm(clip_norm),
@@ -122,7 +163,7 @@ def make_optimizer(
     # Differentiate/optimize ONLY nnx.Param leaves; the MoE router_bias
     # (nnx.Variable) is deliberately excluded — it is updated by the
     # aux-loss-free rule in the training loop instead.
-    return nnx.Optimizer(model, tx, wrt=nnx.Param)
+    return MuonClipOptimizer(model, tx, qk_clip_tau=qk_clip_tau, wrt=nnx.Param)
 
 
 # --------------------------------------------------------------------------- #
@@ -139,9 +180,10 @@ def apply_qk_clip(model: nnx.Module, max_logits: jax.Array, tau: float) -> None:
     Heads under the threshold get gamma = 1 (a no-op) — as training
     stabilizes, this whole function converges to the identity.
 
-    Mutates the model in place (like the router-bias nudge in train.py); call
-    it right AFTER optimizer.update so the clip sees the just-updated weights'
-    logits at the next step.
+    Mutates the model in place (like the router-bias nudge in train.py).
+    MuonClipOptimizer.update calls this right AFTER the gradient update so
+    the clip sees the just-updated weights' logits at the next step; it is
+    kept independently callable for tests and manual use.
     """
     mla_layers = [layer for layer in model.layers if layer.is_full_attn]
     if len(mla_layers) != max_logits.shape[0]:

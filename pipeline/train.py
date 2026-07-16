@@ -78,7 +78,7 @@ from multi_latent_attention.moe import update_router_bias
 from pipeline import data as data_mod
 from pipeline.checkpointing import CheckpointManager
 from pipeline.config import ExperimentConfig
-from pipeline.optimizer import apply_qk_clip, make_optimizer
+from pipeline.optimizer import MuonClipOptimizer, make_optimizer
 
 
 # --------------------------------------------------------------------------- #
@@ -99,14 +99,14 @@ def build_schedule(tc) -> optax.Schedule:
     )
 
 
-def build_optimizer(model: KimiLinear, cfg: ExperimentConfig) -> nnx.Optimizer:
-    """Global-norm clip -> Muon (weight matrices) / AdamW (embed/head + 1D +
-    3D params, per Moonlight/Kimi), our own MuonClip implementation (see
-    pipeline/muon.py + pipeline/optimizer.py).
-    Muon's consistent-RMS scaling keeps the same LR scale as a plain-AdamW setup,
-    so tc.lr is unchanged; weight decay touches only the Muon-side (2D) params.
-    The QK-Clip half of MuonClip is applied inside the train step (it needs each
-    step's max attention logits), gated by tc.qk_clip."""
+def build_optimizer(model: KimiLinear, cfg: ExperimentConfig) -> MuonClipOptimizer:
+    """MuonClip (see pipeline/muon.py + pipeline/optimizer.py): global-norm
+    clip -> Muon (weight matrices) / AdamW (embed/head + 1D + 3D params, per
+    Moonlight/Kimi), plus QK-Clip inside optimizer.update — armed with
+    tc.qk_clip_tau when tc.qk_clip is on, disarmed (plain Muon) otherwise.
+    Muon's consistent-RMS scaling keeps the same LR scale as a plain-AdamW
+    setup, so tc.lr is unchanged; weight decay touches only the Muon-side
+    matrices."""
     tc = cfg.train
     return make_optimizer(
         model,
@@ -118,6 +118,7 @@ def build_optimizer(model: KimiLinear, cfg: ExperimentConfig) -> nnx.Optimizer:
         eps=tc.eps,
         muon_beta=tc.muon_beta,
         muon_ns_steps=tc.muon_ns_steps,
+        qk_clip_tau=tc.qk_clip_tau if tc.qk_clip else None,
     )
 
 
@@ -140,12 +141,12 @@ def loss_fn(model: KimiLinear, batch: dict[str, jax.Array]):
 _PARAM_FILTER = (nnx.Param, ...)
 
 
-def make_train_step(mesh: Mesh, qk_clip_tau: float | None = None):
+def make_train_step(mesh: Mesh):
     """Build the data-parallel train step bound to `mesh` (single axis "data").
 
-    `qk_clip_tau` enables MuonClip's QK-Clip: after each optimizer update, any
-    MLA head whose max attention logit (pmax-ed across replicas) exceeded tau
-    is rescaled (see pipeline/optimizer.py). None => plain Muon, no clipping.
+    The optimizer is a MuonClipOptimizer: its update consumes the step's max
+    attention logits (pmax-ed across replicas) and applies QK-Clip after the
+    gradient update — or skips it when built without a tau (plain Muon).
 
     The forward + backward runs inside `shard_map`, so each device processes ONLY its
     shard of the batch and the MoE's token dispatch (argsort / ragged_dot / scatter-add
@@ -162,7 +163,7 @@ def make_train_step(mesh: Mesh, qk_clip_tau: float | None = None):
     """
 
     @nnx.jit
-    def train_step(model: KimiLinear, optimizer: nnx.Optimizer,
+    def train_step(model: KimiLinear, optimizer: MuonClipOptimizer,
                    batch: dict[str, jax.Array], router_bias_lr: float):
         graphdef, params, rest = nnx.split(model, *_PARAM_FILTER)
 
@@ -190,12 +191,10 @@ def make_train_step(mesh: Mesh, qk_clip_tau: float | None = None):
         )(params, rest, batch)
 
         # Grads/counts/logits are identical across replicas now, so these replicated
-        # updates keep params + router_bias in sync on every device.
-        optimizer.update(model, grads)
-        if qk_clip_tau is not None:
-            # MuonClip's QK-Clip: rescale any MLA head whose max logit blew past
-            # tau this step. A per-head no-op once training is stable.
-            apply_qk_clip(model, max_logits, qk_clip_tau)
+        # updates keep params + router_bias in sync on every device. MuonClip's
+        # QK-Clip runs inside update: any MLA head whose max logit blew past
+        # tau this step is rescaled — a per-head no-op once training is stable.
+        optimizer.update(model, grads, max_logits=max_logits)
         for i, layer in enumerate(model.layers):
             moe = layer.channel_mixer
             moe.router_bias.set_value(
@@ -318,8 +317,7 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
     for obj in (model, optimizer, rngs):
         nnx.update(obj, jax.device_put(nnx.state(obj), repl_shard))
     shard_batch = lambda b: jax.device_put(b, data_shard)  # noqa: E731
-    train_step = make_train_step(
-        mesh, qk_clip_tau=tc.qk_clip_tau if tc.qk_clip else None)
+    train_step = make_train_step(mesh)
     eval_step = make_eval_step(mesh)
     if n_dev > 1:
         print(f"Data-parallel over {n_dev} devices "

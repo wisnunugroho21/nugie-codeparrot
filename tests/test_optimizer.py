@@ -207,6 +207,36 @@ def test_qk_clip_row_count_mismatch_raises():
         apply_qk_clip(model, jnp.zeros((3, CFG.mla_num_q_heads)), tau=100.0)
 
 
+def test_muonclip_optimizer_clips_inside_update():
+    """MuonClip packaged as ONE optimizer: update(model, grads, max_logits)
+    must run QK-Clip after the gradient step. lr=0 zeroes the gradient part,
+    so any weight change is the clip — exceeding heads must land exactly at
+    tau on the next forward, heads under tau must be untouched."""
+    model = KimiLinear(CFG, rngs=nnx.Rngs(0))
+    attn = model.layers[3].token_mixer  # the one MLA layer
+    attn.w_q_uk.kernel.set_value(attn.w_q_uk.kernel.get_value() * 300.0)
+
+    ids = jnp.asarray(
+        np.random.default_rng(0).integers(0, CFG.vocab_size, size=(2, 32)),
+        jnp.int32)
+
+    def loss_fn(m):
+        logits, aux = m(ids)
+        return logits.mean() + aux["aux_loss"], aux
+
+    (_, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+    before = aux["mla_max_logits"][0]  # [Hq]
+    tau = float(jnp.sort(before)[before.shape[0] // 2])  # split the heads
+
+    optimizer = make_optimizer(model, 0.0, qk_clip_tau=tau, verbose=False)
+    optimizer.update(model, grads, max_logits=aux["mla_max_logits"])
+
+    _, aux2 = model(ids)
+    after = np.asarray(aux2["mla_max_logits"][0])
+    np.testing.assert_allclose(
+        after, np.minimum(np.asarray(before), tau), rtol=1e-4)
+
+
 # --------------------------------------------------------------------------- #
 #  End-to-end smoke test: a few real optimizer steps.
 # --------------------------------------------------------------------------- #
