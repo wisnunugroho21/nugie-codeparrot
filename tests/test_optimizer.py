@@ -126,14 +126,22 @@ def test_scheduled_lr_is_stepped():
 # --------------------------------------------------------------------------- #
 #  The Muon/AdamW split on the real model.
 # --------------------------------------------------------------------------- #
-def test_param_split_follows_moonlight():
+def test_param_split_is_strictly_by_dimension():
+    """The project's split rule: every 2D param -> Muon, everything else ->
+    AdamW. Pin the label of each parameter family so a surprise shape change
+    (or a rule regression) fails loudly."""
     model = KimiLinear(CFG, rngs=nnx.Rngs(0))
     params = nnx.state(model, nnx.Param)
-    labels = {}
+    labels, dims = {}, {}
     for path, leaf in jax.tree_util.tree_leaves_with_path(params):
         names = [str(getattr(k, a)) for k in path
                  for a in ("key", "name", "idx") if hasattr(k, a)]
-        labels["/".join(names)] = _label(path, leaf)
+        key = "/".join(names)
+        labels[key], dims[key] = _label(path, leaf), leaf.ndim
+
+    # The rule itself, over every real param.
+    for key, ndim in dims.items():
+        assert labels[key] == ("muon" if ndim == 2 else "adamw"), (key, ndim)
 
     def label_of(fragment):
         hits = {k: v for k, v in labels.items() if fragment in k}
@@ -141,17 +149,19 @@ def test_param_split_follows_moonlight():
         assert len(set(hits.values())) == 1, hits
         return next(iter(hits.values()))
 
-    # AdamW: embedding, LM head, per-channel decays, norm gains, the
-    # depthwise short-conv kernel. ("norm1/weight" not bare "norm": GDN-2's
-    # o_norm also CONTAINS a 2D gate Linear, which correctly goes to Muon.)
-    for frag in ("embed", "lm_head", "A_log", "dt_bias", "norm1/weight",
-                 "o_norm/norm/weight", "conv"):
-        assert label_of(frag) == "adamw", frag
-    # Muon: every matmul matrix — attention/GDN projections, the o_norm gate,
-    # MoE experts (stacked 3D), and the router.
-    for frag in ("w_q_uk", "w_dkv", "w_uv_o", "q_proj", "o_norm/gate",
-                 "w_in", "w_out", "router"):
+    # Muon: every 2D param — all Linear kernels (projections, gates, router),
+    # and, per this project's strictly-dimensional choice, also the embedding
+    # and LM head (Moonlight would put those two on AdamW).
+    for frag in ("embed", "lm_head", "w_q_uk", "w_dkv", "w_uv_o",
+                 "q_proj", "o_norm/gate", "router"):
         assert label_of(frag) == "muon", frag
+    # AdamW: 1D params (biases, norm gains, the GDN-2 A_log [H] and dt_bias)
+    # and 3D params (the stacked MoE experts, the depthwise short-conv
+    # kernel). "norm1/weight" not bare "norm": GDN-2's o_norm also CONTAINS
+    # the 2D gate Linear above.
+    for frag in ("A_log", "dt_bias", "norm1/weight", "o_norm/norm/weight",
+                 "conv", "w_in", "w_out"):
+        assert label_of(frag) == "adamw", frag
 
 
 # --------------------------------------------------------------------------- #

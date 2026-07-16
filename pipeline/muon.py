@@ -19,10 +19,11 @@ which pushes every singular value of the (normalized) momentum toward 1 — an
 approximation of U V^T from the SVD of the momentum. The update then moves
 every direction with equal strength (steepest descent under the spectral norm)
 instead of being dominated by a few large singular values. Orthogonalization
-is only defined for matrices, so Muon covers only parameters that ACT as
-matrices in a matmul; everything else (embeddings, biases, norm gains, ...)
-falls back to AdamW, exactly as in Moonlight. Both Moonlight adjustments are
-included:
+is only defined for matrices, so Muon covers matrix parameters and everything
+else falls back to AdamW; WHICH params count as matrices is the caller's
+policy, passed to `muon()` as `param_labels` (this project's rule — strictly
+2D -> Muon, all else -> AdamW — lives in pipeline/optimizer.py). Both
+Moonlight adjustments are included:
 
   * weight decay inside the Muon update (their Sec. 2.2), and
   * consistent-RMS scaling by 0.2 * sqrt(max(fan_in, fan_out)), which matches

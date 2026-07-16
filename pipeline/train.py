@@ -15,11 +15,12 @@ LOSS
 OPTIMIZER
     MuonClip (our from-scratch implementation, pipeline/muon.py) with a linear
     warmup + cosine decay schedule and global-norm gradient clipping: Muon
-    (orthogonalized momentum) on the hidden weight matrices, AdamW on everything
-    else, and — after every optimizer update — QK-Clip: any MLA attention head
-    whose max logit exceeded tau this step has its query projection rescaled so
-    the logits stay capped (Kimi K2's fix for Muon's exploding attention logits).
-    Weight decay applies only to the Muon-side matrices.
+    (orthogonalized momentum) on every 2D parameter, AdamW on the rest (1D
+    biases/norms/decays, 3D expert stacks and conv kernels), and — after every
+    optimizer update — QK-Clip: any MLA attention head whose max logit exceeded
+    tau this step has its query projection rescaled so the logits stay capped
+    (Kimi K2's fix for Muon's exploding attention logits). Weight decay applies
+    only to the Muon-side (2D) params.
 
 MIXED PRECISION
     Governed entirely by model.compute_dtype (fp32 by default; set "bfloat16" on a
@@ -98,12 +99,12 @@ def build_schedule(tc) -> optax.Schedule:
 
 
 def build_optimizer(model: KimiLinear, cfg: ExperimentConfig) -> nnx.Optimizer:
-    """Global-norm clip -> Muon (hidden weight matrices) / AdamW (everything else),
-    our own MuonClip implementation (see pipeline/muon.py + pipeline/optimizer.py).
-    Muon's consistent-RMS scaling keeps the same LR scale as a plain-AdamW setup, so
-    tc.lr is unchanged; weight decay touches only the Muon-side matrices (not
-    embed/head/norms/biases). The QK-Clip half of MuonClip is applied inside the
-    train step (it needs each step's max attention logits), gated by tc.qk_clip."""
+    """Global-norm clip -> Muon (2D params) / AdamW (1D + 3D params), our own
+    MuonClip implementation (see pipeline/muon.py + pipeline/optimizer.py).
+    Muon's consistent-RMS scaling keeps the same LR scale as a plain-AdamW setup,
+    so tc.lr is unchanged; weight decay touches only the Muon-side (2D) params.
+    The QK-Clip half of MuonClip is applied inside the train step (it needs each
+    step's max attention logits), gated by tc.qk_clip."""
     tc = cfg.train
     return make_optimizer(
         model,

@@ -6,17 +6,20 @@ SCRATCH in pipeline/muon.py (Newton-Schulz orthogonalization, the Moonlight
 weight-decay + consistent-RMS adjustments, a from-scratch AdamW side, and the
 QK-Clip math). This module is the model-aware glue:
 
-  * `_label` decides, per parameter, which side updates it — the Moonlight
-    split:
+  * `_label` decides, per parameter, which side updates it — STRICTLY BY
+    DIMENSION (a deliberate project choice):
 
-      Muon : parameters that ACT as matrices in a matmul — all Linear kernels,
-             and the MoE's stacked expert tensors [E, d_in, d_out], which the
-             Newton-Schulz step treats as E independent matrices (it operates
-             on the last two axes; leading axes are batch).
-      AdamW: everything else — the embedding and LM head (Moonlight keeps both
-             on AdamW), and all non-matrix parameters: biases, RMSNorm gains,
-             the GDN-2 decay parameters A_log / dt_bias, and the depthwise
-             short-conv kernels (shape [width, 1, C] — not a matmul matrix).
+      Muon : every 2D parameter — all Linear kernels (projections, gates,
+             router, LM head) and the embedding table.
+      AdamW: everything else — 1D params (biases, RMSNorm gains, the GDN-2
+             decay params A_log [H] / dt_bias) and 3D params (the stacked MoE
+             expert tensors [E, d_in, d_out] and the depthwise short-conv
+             kernels [width, 1, C]).
+
+    Note this deviates from the Moonlight/Kimi recipe in two places: they keep
+    the (2D) embedding + LM head on AdamW, and they run Muon on the 3D expert
+    stacks as E independent matrices (pipeline/muon.py's `orthogonalize` still
+    supports that via batching, if the split is ever revisited).
 
   * `make_optimizer` assembles global-norm clip -> muon(...) into an
     nnx.Optimizer. Muon's consistent-RMS scaling matches its update RMS to
@@ -43,36 +46,12 @@ from flax import nnx
 from pipeline.muon import clip_query_kernel, muon, qk_clip_factors
 
 
-def _path_names(path) -> set[str]:
-    """The attribute/key names along one pytree path, e.g. {'layers', '0',
-    'token_mixer', 'q_proj', 'kernel', 'value'}."""
-    names = set()
-    for k in path:
-        for attr in ("key", "name", "idx"):
-            if hasattr(k, attr):
-                names.add(str(getattr(k, attr)))
-                break
-    return names
-
-
 def _label(path, leaf) -> str:
-    """Classify one parameter: "muon" (a hidden weight matrix) or "adamw"."""
-    names = _path_names(path)
-
-    # Moonlight: embedding + LM head stay on AdamW. A_log is 2D [H, dk] but is a
-    # per-channel decay parameter, not a matmul weight — AdamW as well.
-    if names & {"embed", "lm_head", "A_log"}:
-        return "adamw"
-
-    if names & {"w_in", "w_out"} and leaf.ndim == 3:
-        return "muon"  # MoE experts: E stacked matrices, batched Newton-Schulz
-
-    if leaf.ndim == 2:
-        return "muon"  # every Linear kernel (projections, gates, router, ...)
-
-    # Biases, RMSNorm gains, dt_bias (1D) and depthwise conv kernels (3D but
-    # not a matmul matrix) -> AdamW.
-    return "adamw"
+    """Classify one parameter strictly by dimension: every 2D param is "muon",
+    everything else (1D biases/norms/decays, 3D expert stacks and depthwise
+    conv kernels) is "adamw". See the module docstring for the trade-offs."""
+    del path  # the rule is purely shape-based
+    return "muon" if leaf.ndim == 2 else "adamw"
 
 
 def _label_tree(params):
@@ -108,11 +87,11 @@ def make_optimizer(
             _label_tree,
             beta=muon_beta,             # Muon momentum (matrices)
             ns_steps=muon_ns_steps,     # Newton-Schulz iterations
-            weight_decay=weight_decay,  # decays ONLY the Muon-side matrices
+            weight_decay=weight_decay,  # decays ONLY the Muon side (all 2D params)
             adam_b1=adam_b1,
             adam_b2=adam_b2,
             eps=eps,
-            adam_weight_decay=0.0,      # embed/head/biases/norms/decays: no decay
+            adam_weight_decay=0.0,      # AdamW side (1D/3D params): no decay
             consistent_rms=0.2,         # Moonlight: match AdamW's update RMS
         ),
     )
@@ -123,8 +102,8 @@ def make_optimizer(
         n_muon = sum(l.size for p, l in leaves if _label(p, l) == "muon")
         n_adam = sum(l.size for p, l in leaves if _label(p, l) == "adamw")
         print(
-            f"optimizer: Muon on {n_muon:,} matrix params, "
-            f"AdamW on {n_adam:,} others (embed/head/biases/norms/decays)"
+            f"optimizer: Muon on {n_muon:,} 2D params, "
+            f"AdamW on {n_adam:,} others (1D biases/norms/decays, 3D experts/conv)"
         )
 
     # Differentiate/optimize ONLY nnx.Param leaves; the MoE router_bias

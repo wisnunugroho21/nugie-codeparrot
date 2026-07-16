@@ -118,13 +118,15 @@ repeats, and prefetches. `seq_len` must be a multiple of `gdn_chunk_size` (64) a
 `≤ max_seq_len`; the config validates this at startup.
 
 **Optimization (MuonClip, from scratch).** Kimi Linear / Kimi K2's optimizers,
-reimplemented in `pipeline/muon.py` rather than taken from `optax.contrib`. **Muon**
-(Moonlight recipe): momentum orthogonalized by 5 Newton-Schulz iterations, applied to
-the hidden weight matrices (all Linear kernels + the stacked MoE expert tensors, which
-the batched Newton-Schulz treats as E independent matrices); a from-scratch **AdamW**
-side updates everything else (embedding, LM head, RMSNorm gains, biases, and the GDN-2
-decay params). Muon's consistent-RMS scaling (0.2·√max(fan_in, fan_out)) means one
-learning rate drives both sides. **QK-Clip** (the "Clip" in MuonClip, Kimi K2 Sec. 2.1)
+reimplemented in `pipeline/muon.py` rather than taken from `optax.contrib`. **Muon**:
+momentum orthogonalized by 5 Newton-Schulz iterations, applied — strictly by dimension —
+to every **2D** parameter (all Linear kernels, the embedding, the LM head); a
+from-scratch **AdamW** side updates everything else — **1D** params (biases, RMSNorm
+gains, the GDN-2 decay params A_log/dt_bias) and **3D** params (the stacked MoE expert
+tensors, the depthwise conv kernels). (This deviates from the Moonlight recipe, which keeps the embedding/head
+on AdamW and runs Muon on the expert stacks; `orthogonalize` still supports batched 3D
+stacks if you revisit the split in `pipeline/optimizer.py`.) Muon's consistent-RMS
+scaling (0.2·√max(fan_in, fan_out)) means one learning rate drives both sides. **QK-Clip** (the "Clip" in MuonClip, Kimi K2 Sec. 2.1)
 guards against Muon's exploding attention logits: each MLA layer's forward reports its
 per-head max attention logit, and after every optimizer step any head over `qk_clip_tau`
 (default 100) has its query projection rescaled by τ/S_h — capping the logits at the
