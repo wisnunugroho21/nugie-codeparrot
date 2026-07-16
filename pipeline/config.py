@@ -69,8 +69,9 @@ class TrainConfig:
     batch_size: int = 16
     max_steps: int = 10000
 
-    # --- Optimizer (MuonClip: our own Muon on every 2D param + AdamW on the
-    # rest (1D/3D) + QK-Clip on the MLA heads; see pipeline/muon.py) ---
+    # --- Optimizer (MuonClip: our own Muon on the weight matrices + AdamW on
+    # the rest (embed/head, 1D/3D) + QK-Clip on the MLA heads; see
+    # pipeline/muon.py) ---
     # Muon's consistent-RMS scaling matches AdamW's update RMS, so lr /
     # weight_decay are the same scale you would give plain AdamW.
     lr: float = 3e-4

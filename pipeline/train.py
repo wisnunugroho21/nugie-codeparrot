@@ -15,8 +15,9 @@ LOSS
 OPTIMIZER
     MuonClip (our from-scratch implementation, pipeline/muon.py) with a linear
     warmup + cosine decay schedule and global-norm gradient clipping: Muon
-    (orthogonalized momentum) on every 2D parameter, AdamW on the rest (1D
-    biases/norms/decays, 3D expert stacks and conv kernels), and — after every
+    (orthogonalized momentum) on the weight matrices, AdamW on the rest (the
+    embedding + LM head per the Moonlight/Kimi recipe, 1D biases/norms/decays,
+    3D expert stacks and conv kernels), and — after every
     optimizer update — QK-Clip: any MLA attention head whose max logit exceeded
     tau this step has its query projection rescaled so the logits stay capped
     (Kimi K2's fix for Muon's exploding attention logits). Weight decay applies
@@ -99,8 +100,9 @@ def build_schedule(tc) -> optax.Schedule:
 
 
 def build_optimizer(model: KimiLinear, cfg: ExperimentConfig) -> nnx.Optimizer:
-    """Global-norm clip -> Muon (2D params) / AdamW (1D + 3D params), our own
-    MuonClip implementation (see pipeline/muon.py + pipeline/optimizer.py).
+    """Global-norm clip -> Muon (weight matrices) / AdamW (embed/head + 1D +
+    3D params, per Moonlight/Kimi), our own MuonClip implementation (see
+    pipeline/muon.py + pipeline/optimizer.py).
     Muon's consistent-RMS scaling keeps the same LR scale as a plain-AdamW setup,
     so tc.lr is unchanged; weight decay touches only the Muon-side (2D) params.
     The QK-Clip half of MuonClip is applied inside the train step (it needs each

@@ -6,20 +6,23 @@ SCRATCH in pipeline/muon.py (Newton-Schulz orthogonalization, the Moonlight
 weight-decay + consistent-RMS adjustments, a from-scratch AdamW side, and the
 QK-Clip math). This module is the model-aware glue:
 
-  * `_label` decides, per parameter, which side updates it — STRICTLY BY
-    DIMENSION (a deliberate project choice):
+  * `_label` decides, per parameter, which side updates it — by dimension,
+    with the Moonlight/Kimi embedding/head exception:
 
-      Muon : every 2D parameter — all Linear kernels (projections, gates,
-             router, LM head) and the embedding table.
-      AdamW: everything else — 1D params (biases, RMSNorm gains, the GDN-2
-             decay params A_log [H] / dt_bias) and 3D params (the stacked MoE
-             expert tensors [E, d_in, d_out] and the depthwise short-conv
-             kernels [width, 1, C]).
+      Muon : every 2D parameter EXCEPT the embedding table and the LM head —
+             all Linear kernels (projections, gates, router).
+      AdamW: everything else — the embedding + LM head (Moonlight/Kimi keep
+             both on AdamW: the embedding's gradient is row-sparse, and
+             orthogonalizing it smears a full-RMS update across every vocab
+             row, including tokens absent from the batch), 1D params (biases,
+             RMSNorm gains, the GDN-2 decay params A_log [H] / dt_bias) and
+             3D params (the stacked MoE expert tensors [E, d_in, d_out] and
+             the depthwise short-conv kernels [width, 1, C]).
 
-    Note this deviates from the Moonlight/Kimi recipe in two places: they keep
-    the (2D) embedding + LM head on AdamW, and they run Muon on the 3D expert
-    stacks as E independent matrices (pipeline/muon.py's `orthogonalize` still
-    supports that via batching, if the split is ever revisited).
+    One remaining deviation from the Moonlight/Kimi recipe: they run Muon on
+    the 3D expert stacks as E independent matrices (pipeline/muon.py's
+    `orthogonalize` still supports that via batching, if the split is ever
+    revisited).
 
   * `make_optimizer` assembles global-norm clip -> muon(...) into an
     nnx.Optimizer. Muon's consistent-RMS scaling matches its update RMS to
@@ -46,12 +49,21 @@ from flax import nnx
 from pipeline.muon import clip_query_kernel, muon, qk_clip_factors
 
 
+# 2D params exempted from Muon (path components), per the Moonlight/Kimi
+# recipe: the embedding table and the untied LM head stay on AdamW.
+_ADAMW_2D = ("embed", "lm_head")
+
+
 def _label(path, leaf) -> str:
-    """Classify one parameter strictly by dimension: every 2D param is "muon",
+    """Classify one parameter: every 2D param is "muon" — except the embedding
+    and LM head, which follow Moonlight/Kimi onto the AdamW side — and
     everything else (1D biases/norms/decays, 3D expert stacks and depthwise
     conv kernels) is "adamw". See the module docstring for the trade-offs."""
-    del path  # the rule is purely shape-based
-    return "muon" if leaf.ndim == 2 else "adamw"
+    if leaf.ndim != 2:
+        return "adamw"
+    names = [str(getattr(k, a)) for k in path
+             for a in ("key", "name", "idx") if hasattr(k, a)]
+    return "adamw" if any(n in _ADAMW_2D for n in names) else "muon"
 
 
 def _label_tree(params):
@@ -87,7 +99,7 @@ def make_optimizer(
             _label_tree,
             beta=muon_beta,             # Muon momentum (matrices)
             ns_steps=muon_ns_steps,     # Newton-Schulz iterations
-            weight_decay=weight_decay,  # decays ONLY the Muon side (all 2D params)
+            weight_decay=weight_decay,  # decays ONLY the Muon-side matrices
             adam_b1=adam_b1,
             adam_b2=adam_b2,
             eps=eps,
@@ -102,8 +114,9 @@ def make_optimizer(
         n_muon = sum(l.size for p, l in leaves if _label(p, l) == "muon")
         n_adam = sum(l.size for p, l in leaves if _label(p, l) == "adamw")
         print(
-            f"optimizer: Muon on {n_muon:,} 2D params, "
-            f"AdamW on {n_adam:,} others (1D biases/norms/decays, 3D experts/conv)"
+            f"optimizer: Muon on {n_muon:,} matrix params, "
+            f"AdamW on {n_adam:,} others (embed/head, 1D biases/norms/decays, "
+            f"3D experts/conv)"
         )
 
     # Differentiate/optimize ONLY nnx.Param leaves; the MoE router_bias

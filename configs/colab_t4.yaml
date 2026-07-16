@@ -26,6 +26,11 @@ model:
   mla_num_kv_heads: 2
   mla_head_dim: 64
   max_seq_len: 1024
+  # Overflow-proof GDN-2 core: the default "centered" core NaNs once a chunk's
+  # cumulative log-decay |G_C| outgrows ~176 (and its BACKWARD pass overflows
+  # even earlier), which Muon-trained f_proj reaches mid-run. "subchunking"
+  # keeps every materialized exponent <= 0 — no decay-range limit.
+  gdn_core: subchunking
   moe_d_ff: 1024
   moe_n_routed: 8
   moe_n_shared: 1

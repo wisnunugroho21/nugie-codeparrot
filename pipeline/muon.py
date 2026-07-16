@@ -21,9 +21,9 @@ every direction with equal strength (steepest descent under the spectral norm)
 instead of being dominated by a few large singular values. Orthogonalization
 is only defined for matrices, so Muon covers matrix parameters and everything
 else falls back to AdamW; WHICH params count as matrices is the caller's
-policy, passed to `muon()` as `param_labels` (this project's rule — strictly
-2D -> Muon, all else -> AdamW — lives in pipeline/optimizer.py). Both
-Moonlight adjustments are included:
+policy, passed to `muon()` as `param_labels` (this project's rule — 2D ->
+Muon except the embedding/LM head, all else -> AdamW, per Moonlight — lives
+in pipeline/optimizer.py). Both Moonlight adjustments are included:
 
   * weight decay inside the Muon update (their Sec. 2.2), and
   * consistent-RMS scaling by 0.2 * sqrt(max(fan_in, fan_out)), which matches
