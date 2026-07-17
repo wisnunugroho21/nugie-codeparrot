@@ -97,20 +97,47 @@ class RMSNorm(nnx.Module):
         return (xf * rms * self.weight[...]).astype(x.dtype)
 
 
+class LowRankLinear(nnx.Module):
+    """y = W_up(W_down x). The W↑(W↓·) factorization Kimi Linear uses for its
+    output gate and decay, kept at rank = head dim for parameter parity."""
+
+    def __init__(
+        self,
+        in_features: int,
+        rank: int,
+        out_features: int,
+        *,
+        use_bias: bool = False,
+        rngs: nnx.Rngs,
+    ):
+        self.down = nnx.Linear(
+            in_features, rank, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+        )
+        self.up = nnx.Linear(
+            rank, out_features, use_bias=use_bias, kernel_init=_XAVIER, rngs=rngs
+        )
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x = self.down(x)
+        return self.up(x)
+
+
 class GatedRMSNorm(nnx.Module):
-    """Head-wise RMSNorm of the recurrent output, multiplied by a SiLU gate.
+    """Head-wise RMSNorm of the recurrent output, gated by a LOW-RANK SIGMOID gate.
 
-    The paper's output stage — Sec. 3.5: "The recurrent output is
-    RMS-normalized, multiplied by a separate SiLU output gate, and passed
-    through the output projection"; App. D.5: "the output is passed through
-    an RMSNorm and SiLU gate before the final output projection":
+    Implements Kimi Linear Eq. 10's output stage:
 
-        SiLU(Proj_g x) ⊙ RMSNorm(O)
+        Sigmoid(W↑g W↓g x) ⊙ RMSNorm(O)
 
-    The gate is produced from the block input x by a full-rank projection
-    (the 'Lin.' gate branch feeding the Norm/multiply in Fig. 1 right). It is
-    computed INSIDE this module, so the call site in the layer collapses to
-    `O = self.o_norm(O_heads, x)` (no separate gate_proj).
+    Two corrections vs the GDN-2 paper block used in your gdn2_layer:
+      (1) sigmoid, not SiLU/swish  — Kimi Linear's ablation found the swish output
+          gate (GDN's choice) performs substantially worse than sigmoid, and they
+          adopt sigmoid across all experiments including their GDN hybrid baseline.
+      (2) low-rank gate (W↑ W↓), rank = head dim — Kimi Linear factorizes the gate
+          "to ensure a fair parameter comparison" against the full-attention baseline.
+
+    The gate is produced INSIDE the norm from the block input x, so the call site in
+    your layer collapses to `O = self.o_norm(O_heads, x)` (no separate gate_proj).
     """
 
     def __init__(
@@ -118,15 +145,14 @@ class GatedRMSNorm(nnx.Module):
         head_dim: int,
         d_model: int,
         inner_dim: int,
+        gate_rank: int,
         *,
         eps: float = 1e-5,
         rngs: nnx.Rngs,
     ):
         self.norm = RMSNorm(head_dim, eps=eps)
-        # Deliberately NO compute_dtype here (unlike the q/k/v/b/w/o projections):
-        # the gate multiplies the fp32-normalized output, so it is kept in fp32.
-        self.gate = nnx.Linear(
-            d_model, inner_dim, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+        self.gate = LowRankLinear(
+            d_model, gate_rank, inner_dim, use_bias=False, rngs=rngs
         )
 
     def __call__(self, O_heads: jax.Array, x: jax.Array) -> jax.Array:
@@ -136,7 +162,8 @@ class GatedRMSNorm(nnx.Module):
         o = O_heads.astype(F32)  # [B,L,Hv,dv] -> fp32 for RMSNorm
         o = self.norm(o)  # head-wise RMSNorm
 
-        g = jax.nn.silu(self.gate(x).astype(F32))  # SiLU output gate (App. D.5)
+        g = self.gate(x).astype(F32)  # low-rank gate
+        g = jax.nn.sigmoid(g)  # low-rank SIGMOID gate
         g = g.reshape(B, L, Hv, dv)
 
         return (o * g).reshape(B, L, Hv * dv)
@@ -299,14 +326,8 @@ class GatedDeltaNet2(nnx.Module):
             param_dtype=F32,
             rngs=rngs,
         )  # Proj_w, Eq. 85: w = σ(Proj_w x)
-        self.f_proj = nnx.Linear(
-            d_model,
-            k_proj_dim,
-            use_bias=False,  # the Eq. 86 bias is δ (dt_bias), stored separately per key channel
-            kernel_init=_XAVIER,
-            dtype=F32,  # decay branch stays fp32 end-to-end (App. D.1)
-            param_dtype=F32,
-            rngs=rngs,
+        self.f_proj = LowRankLinear(
+            d_model, self.dk, k_proj_dim, use_bias=True, rngs=rngs
         )  # Proj_f, Eq. 86 (log-decay), d_model -> H·d_k
 
         # Short causal convs on q, k, v (App. C.1: "short-convolutional projections for q, k, v").
@@ -342,6 +363,7 @@ class GatedDeltaNet2(nnx.Module):
             head_dim=self.dv,
             d_model=d_model,
             inner_dim=self.Hv * self.dv,
+            gate_rank=self.dv,
             rngs=rngs,
         )
 
